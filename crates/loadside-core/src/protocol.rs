@@ -78,6 +78,10 @@ pub enum Event {
     PromptClosed { id: String },
     Log { line: LogLine },
     Notice { level: String, title: String, message: String },
+    /// The scheduler's next automatic check moved.
+    Schedule { next_check_at: Option<i64> },
+    /// Settings changed (from any client, the CLI included).
+    Config { config: crate::config::Config },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

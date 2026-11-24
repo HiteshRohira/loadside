@@ -55,7 +55,7 @@ struct OnboardingView: View {
             }
         }
         .sheet(item: Binding(get: { store.prompts.first }, set: { _ in })) { prompt in
-            PromptSheet(prompt: prompt).environment(store).interactiveDismissDisabled()
+            PromptSheet(prompt: prompt).id(prompt.id).environment(store).interactiveDismissDisabled()
         }
     }
 

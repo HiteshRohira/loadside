@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     loadside_core::init();
 
     // Two worker threads are plenty; signing parallelism comes from rayon.
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     rt.block_on(run(logs))
 }
 
@@ -67,19 +67,10 @@ async fn run(logs: Arc<logging::LogBuffer>) -> anyhow::Result<()> {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
-    for dir in [paths::incoming_dir(), paths::exports_dir()] {
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(3 * 24 * 3600));
-                if old {
-                    let p = e.path();
-                    let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
-                }
-            }
-        }
-    }
 
     let (engine, jobs_rx, check_rx) = engine::Engine::new(logs)?;
+    // Stale hand-off files, but never ones an installed app refreshes from.
+    engine.sweep_staging(Duration::from_secs(3 * 24 * 3600));
 
     tokio::spawn(engine.clone().worker(jobs_rx));
     tokio::spawn(engine.clone().scheduler(check_rx));

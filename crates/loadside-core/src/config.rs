@@ -74,13 +74,39 @@ pub fn default_machine_name() -> String {
 
 /// HTTPS, or plain HTTP only to this Mac (a self-hosted server).
 pub fn anisette_url_ok(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return lower.len() > "https://".len();
+    // Parse rather than compare prefixes: "http://localhost:x@example.com"
+    // looks local but sends to example.com.
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    if !u.username().is_empty() || u.password().is_some() {
+        return false;
     }
-    ["http://localhost", "http://127.0.0.1", "http://[::1]"]
-        .iter()
-        .any(|p| lower == *p || lower.starts_with(&format!("{p}:")) || lower.starts_with(&format!("{p}/")))
+    match (u.scheme(), u.host()) {
+        ("https", Some(_)) => true,
+        // Plain http only to this Mac.
+        ("http", Some(url::Host::Domain(d))) => d.eq_ignore_ascii_case("localhost"),
+        ("http", Some(url::Host::Ipv4(ip))) => ip.is_loopback(),
+        ("http", Some(url::Host::Ipv6(ip))) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod anisette_url_tests {
+    use super::anisette_url_ok;
+    #[test]
+    fn only_https_or_loopback_http() {
+        assert!(anisette_url_ok("https://ani.iloader.app"));
+        assert!(anisette_url_ok("http://localhost:6969"));
+        assert!(anisette_url_ok("http://127.0.0.1:6969/"));
+        assert!(anisette_url_ok("http://[::1]:6969"));
+        assert!(!anisette_url_ok("http://localhost:x@example.com"));
+        assert!(!anisette_url_ok("http://127.0.0.1:80@example.com"));
+        assert!(!anisette_url_ok("https://user:pw@example.com"));
+        assert!(!anisette_url_ok("http://example.com"));
+        assert!(!anisette_url_ok("http://localhost.example.com"));
+        assert!(!anisette_url_ok("ftp://localhost"));
+        assert!(!anisette_url_ok("https://"));
+    }
 }
 
 impl Config {

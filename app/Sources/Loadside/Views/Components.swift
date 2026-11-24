@@ -242,7 +242,7 @@ struct FreeQuotaView: View {
 
     private func footnote(avail: Int?) -> String {
         var parts = ["Free Apple IDs get 10 App IDs per 7 days. Every new app uses one, and so does each of its widgets and other extensions. Refreshing an app you already have uses none.",
-                     "Each device holds 3 sideloaded apps at a time, including ones installed with other tools."]
+                     "Each device holds 3 sideloaded apps at a time. Apps installed with other tools count too, but Loadside can only count its own."]
         if avail == 0, let next = store.appIds?.appIds.compactMap(\.expiresAt).min() { parts.append("The next App ID frees up \(Fmt.rel(next)).") }
         return parts.joined(separator: " ")
     }

@@ -32,17 +32,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             LoginItem.sync(enabled: on)
         }
         if Self.startHidden {
-            // Only the launch itself is hidden: opening Loadside later (Dock,
-            // Finder, the menu bar's "Show all") must show the window.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Self.startHidden = false }
+            // Only the launch itself is hidden. Anything the user does to
+            // bring Loadside up (Dock, Finder, the menu bar) activates it, and
+            // from then on windows show normally.
+            NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { Self.startHidden = false }
+            }
         } else {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
         }
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
-            guard Prefs.menuBarOn, let closing = note.object as? NSWindow, closing.isMainWindowCandidate else { return }
+            guard Prefs.menuBarOn, let closing = note.object as? NSWindow, closing.isUserWindow else { return }
             DispatchQueue.main.async {
-                if !NSApp.windows.contains(where: { $0 !== closing && $0.isMainWindowCandidate && $0.isVisible }) {
+                // Drop the Dock tile only once no real window (main, Settings,
+                // Logs) is left; otherwise their menus and ⌘W/⌘Q vanish.
+                if !NSApp.windows.contains(where: { $0 !== closing && $0.isUserWindow && $0.isVisible }) {
                     NSApp.setActivationPolicy(.accessory)
                 }
             }
@@ -70,6 +75,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 private extension NSWindow {
     /// Real app windows, not the menu bar panel or sheets.
     var isMainWindowCandidate: Bool { identifier?.rawValue.hasPrefix("main") == true }
+    /// Main, Settings and Logs windows: titled, not a panel or sheet.
+    var isUserWindow: Bool { styleMask.contains(.titled) && !(self is NSPanel) && sheetParent == nil && level == .normal }
 }
 
 @main

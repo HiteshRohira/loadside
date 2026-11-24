@@ -64,8 +64,10 @@ PLIST
 # identity stable. Override with LOADSIDE_SIGN_IDENTITY ("-" for ad-hoc).
 SIGN_ID="${LOADSIDE_SIGN_IDENTITY:-}"
 if [ -z "$SIGN_ID" ]; then
-    SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
-        | grep -E '"(Developer ID Application|Apple Development|Mac Developer):' \
+    # No matching certificate is normal on a fresh Mac: fall through to
+    # ad-hoc instead of letting `set -e -o pipefail` stop the build.
+    SIGN_ID=$( { security find-identity -v -p codesigning 2>/dev/null || true; } \
+        | { grep -E '"(Developer ID Application|Apple Development|Mac Developer):' || true; } \
         | head -1 | awk '{print $2}')
 fi
 if [ -z "$SIGN_ID" ] || [ "$SIGN_ID" = "-" ]; then

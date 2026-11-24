@@ -28,6 +28,10 @@ use crate::prompts::Prompter;
 
 const MAX_JOBS_KEPT: usize = 50;
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Longest a sign-in may take, a 2FA prompt included.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Longest a sign + install may take (big apps over slow Wi-Fi included).
+const JOB_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 
 #[derive(Debug, Clone)]
 pub enum JobSpec {
@@ -51,6 +55,8 @@ pub struct Engine {
     pub events: broadcast::Sender<Event>,
     pub prompts: Prompter,
     jobs: Mutex<Vec<JobInfo>>,
+    /// Apps being removed: no new jobs for them until that's done.
+    removing: Mutex<std::collections::HashSet<String>>,
     queue: mpsc::UnboundedSender<QueuedJob>,
     devices: Mutex<BTreeMap<String, DeviceInfo>>,
     /// usbmuxd device id → (udid, connection)
@@ -101,6 +107,7 @@ impl Engine {
             prompts: Prompter::new(events.clone()),
             events,
             jobs: Mutex::default(),
+            removing: Mutex::default(),
             queue,
             devices: Mutex::default(),
             mux: Mutex::default(),
@@ -192,9 +199,12 @@ impl Engine {
     // Session
     // ------------------------------------------------------------------
 
+    /// `allow_prompt`: false for unattended (background) work, which must
+    /// never start a 2FA prompt nobody is looking at.
     fn two_factor_callback(
         self: &Arc<Self>,
         needed_without_client: Arc<std::sync::atomic::AtomicBool>,
+        allow_prompt: bool,
     ) -> impl Fn(TwoFactorCallbackParams) -> futures::future::BoxFuture<'static, Result<TwoFactorCallbackResponse, loadside_core::rootcause::Report>>
     + Send
     + Sync
@@ -204,7 +214,7 @@ impl Engine {
             let engine = engine.clone();
             let flag = needed_without_client.clone();
             Box::pin(async move {
-                if !engine.prompts.has_interactive_client() {
+                if !allow_prompt || !engine.prompts.has_interactive_client() {
                     flag.store(true, Ordering::SeqCst);
                     return Ok(TwoFactorCallbackResponse::Abort);
                 }
@@ -230,8 +240,12 @@ impl Engine {
         let preferred = self.state.lock().unwrap().account.as_ref().filter(|a| a.email == email).and_then(|a| a.team_id.clone());
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         info!("Signing in to Apple ID");
-        let session = account::login(&self.config(), &email, password, preferred.as_deref(), self.two_factor_callback(flag.clone()))
-            .await
+        let session = tokio::time::timeout(
+            LOGIN_TIMEOUT,
+            account::login(&self.config(), &email, password, preferred.as_deref(), self.two_factor_callback(flag.clone(), true)),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Signing in to Apple timed out.")))
             .map_err(|e| {
                 let fl = errors::explain(&e);
                 warn!("Sign-in failed: {} ({})", fl.message, fl.detail.clone().unwrap_or_default());
@@ -266,6 +280,12 @@ impl Engine {
         {
             let mut st = self.state.lock().unwrap();
             st.account = Some(info.clone());
+            // Apps that were waiting on this sign-in can retry right away.
+            for a in st.apps.iter_mut() {
+                if a.last_error.as_ref().is_some_and(|e| matches!(e.code.as_str(), "needs_login" | "needs_2fa" | "keychain")) {
+                    a.last_attempt_at = None;
+                }
+            }
         }
         self.save_state();
         *guard = Some(session);
@@ -282,21 +302,30 @@ impl Engine {
         *self.session.lock().await = None;
         self.logged_in.store(false, Ordering::SeqCst);
         let email = self.state.lock().unwrap().account.take().map(|a| a.email);
-        self.persist()?;
+        // Delete the password first and regardless of the state write: a
+        // signed-out account must never be able to sign itself back in.
+        let keychain = match email {
+            Some(e) => match tokio::task::spawn_blocking(move || secrets::delete_password(&e)).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(e) => Err(e.to_string()),
+            },
+            None => Ok(()),
+        };
+        let persisted = self.persist();
         self.emit_account(false);
-        if let Some(e) = email {
-            let r = tokio::task::spawn_blocking(move || secrets::delete_password(&e)).await;
-            if let Ok(Err(e)) = r {
-                return Err(f("keychain", "Signed out, but the saved password couldn't be removed from the Keychain.")
-                    .with_hint(format!("Remove \"dev.loadside.appleid\" in Keychain Access. ({e:#})")));
-            }
+        if let Err(e) = keychain {
+            return Err(f("keychain", "Signed out, but the saved password couldn't be removed from the Keychain.")
+                .with_hint(format!("Remove \"dev.loadside.appleid\" in Keychain Access. ({e})")));
         }
+        persisted.map_err(|fl| fl.with_hint("Signed out and the saved password was removed, but Loadside couldn't save that it's signed out. Free some disk space."))?;
         Ok(Value::Null)
     }
 
     /// Get a usable session, signing in again with the saved password if
-    /// needed. `interactive` = a human is waiting on this.
-    async fn session(self: &Arc<Self>, force_relogin: bool) -> Result<Session, Failure> {
+    /// needed. `allow_prompt` = a human started this and can answer a 2FA
+    /// prompt; background work never prompts.
+    async fn session(self: &Arc<Self>, force_relogin: bool, allow_prompt: bool) -> Result<Session, Failure> {
         let mut guard = self.session.lock().await;
         if let Some(s) = guard.as_ref() {
             if !force_relogin && !s.is_stale() {
@@ -306,7 +335,7 @@ impl Engine {
         let account = self.state.lock().unwrap().account.clone().ok_or_else(|| {
             f("needs_login", "You're not signed in.").with_hint("Sign in with your Apple ID in Account.")
         })?;
-        if self.needs_interactive_login.load(Ordering::SeqCst) && !self.prompts.has_interactive_client() {
+        if self.needs_interactive_login.load(Ordering::SeqCst) && (!allow_prompt || !self.prompts.has_interactive_client()) {
             return Err(f("needs_2fa", "Sign in again from the Loadside app.")
                 .with_hint("Apple asked for verification during an automatic sign-in. Loadside won't retry on its own (each try can send a code to your devices)."));
         }
@@ -325,7 +354,17 @@ impl Engine {
             })?;
         info!("Session missing or stale; signing in again");
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let res = account::login(&self.config(), &account.email, &password, account.team_id.as_deref(), self.two_factor_callback(flag.clone())).await;
+        // Bounded (a 2FA prompt included) so a stuck sign-in can't hold the
+        // session lock forever.
+        let res = match tokio::time::timeout(
+            LOGIN_TIMEOUT,
+            account::login(&self.config(), &account.email, &password, account.team_id.as_deref(), self.two_factor_callback(flag.clone(), allow_prompt)),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("Signing in to Apple timed out.")),
+        };
         match res {
             Ok(s) => {
                 *guard = Some(s.clone());
@@ -384,7 +423,7 @@ impl Engine {
     }
 
     pub async fn teams(self: &Arc<Self>) -> Result<Value, Failure> {
-        let s = self.session(false).await?;
+        let s = self.session(false, true).await?;
         Ok(json!({
             "selected": s.team.team_id,
             "teams": s.team_summaries(),
@@ -392,7 +431,7 @@ impl Engine {
     }
 
     pub async fn select_team(self: &Arc<Self>, team_id: &str) -> Result<Value, Failure> {
-        self.session(false).await?;
+        self.session(false, true).await?;
         let mut guard = self.session.lock().await;
         let s = guard.as_mut().ok_or_else(|| f("needs_login", "You're not signed in."))?;
         s.select_team(team_id).map_err(|e| errors::explain(&e))?;
@@ -410,13 +449,13 @@ impl Engine {
         F: Fn(Session) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let s = self.session(false).await?;
+        let s = self.session(false, true).await?;
         match op(s).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 let fl = errors::explain(&e);
                 if fl.code == "session_expired" {
-                    let s = self.session(true).await?;
+                    let s = self.session(true, true).await?;
                     op(s).await.map_err(|e| errors::explain(&e))
                 } else {
                     Err(fl)
@@ -525,6 +564,9 @@ impl Engine {
             // Check-and-insert under one lock so two refreshes can't both pass.
             let mut jobs = self.jobs.lock().unwrap();
             if let Some(aid) = &job.app_id {
+                if self.removing.lock().unwrap().contains(aid) {
+                    return Err(f("busy", "This app is being removed."));
+                }
                 if jobs.iter().any(|j| j.app_id.as_deref() == Some(aid) && matches!(j.status, JobStatus::Queued | JobStatus::Running)) {
                     return Err(f("already_queued", "A job for this app is already queued."));
                 }
@@ -680,8 +722,21 @@ impl Engine {
         let config = self.config();
         let mut force = false;
         for attempt in 0..2 {
-            let mut session = self.session(force).await?;
-            let res = pipeline::run(&mut session, &config, req(), self.progress_for(job_id), self.cert_chooser(background)).await;
+            let mut session = self.session(force, !background).await?;
+            // Bounded: one stuck network or device call mustn't hold the single
+            // job queue (and everything waiting behind it) forever.
+            let res = match tokio::time::timeout(
+                JOB_TIMEOUT,
+                pipeline::run(&mut session, &config, req(), self.progress_for(job_id), self.cert_chooser(background)),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(f("timeout", "Signing or installing took too long and was stopped.")
+                        .with_hint("Check that the device stays unlocked and connected, then try again."));
+                }
+            };
             self.store_session_dev(&session).await;
             match res {
                 Ok(o) => return Ok(o),
@@ -723,6 +778,32 @@ impl Engine {
         }
     }
 
+    /// Delete hand-off files (Incoming, Exports) older than `min_age`, except
+    /// those an app still refreshes from or a queued/running job will read.
+    pub fn sweep_staging(&self, min_age: Duration) {
+        let mut keep: Vec<PathBuf> = Vec::new();
+        {
+            let st = self.state.lock().unwrap();
+            for a in &st.apps {
+                keep.push(a.source_path.clone());
+                keep.extend(a.options.inject.iter().cloned());
+            }
+        }
+        for dir in [paths::incoming_dir(), paths::exports_dir()] {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if keep.iter().any(|k| k.starts_with(&p)) {
+                    continue;
+                }
+                let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > min_age);
+                if old {
+                    let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
+                }
+            }
+        }
+    }
+
     fn library_copy(&self, src: &Path, record_id: &str) -> Result<PathBuf> {
         let lib = paths::library_dir();
         std::fs::create_dir_all(&lib)?;
@@ -748,16 +829,22 @@ impl Engine {
             // rename() replaces the old file atomically.
             std::fs::rename(&tmp, &dest)?;
         }
+        // Switching between an .ipa and an .app source leaves the other behind.
+        let other = if src.is_dir() { lib.join(format!("{record_id}.ipa")) } else { lib.join(format!("{record_id}.app")) };
+        let _ = std::fs::remove_file(&other);
+        let _ = std::fs::remove_dir_all(&other);
         Ok(dest)
     }
 
     /// Copy injected tweaks next to the library IPA so refresh keeps working
     /// after the user deletes the originals.
     fn library_inject(&self, items: &[PathBuf], record_id: &str) -> Result<Vec<PathBuf>> {
+        let dir = paths::library_dir().join(format!("{record_id}-inject"));
         if items.is_empty() {
+            // A reinstall without tweaks: drop the old ones.
+            let _ = std::fs::remove_dir_all(&dir);
             return Ok(vec![]);
         }
-        let dir = paths::library_dir().join(format!("{record_id}-inject"));
         if items.iter().all(|i| i.starts_with(&dir)) {
             return Ok(items.to_vec());
         }
@@ -797,6 +884,8 @@ impl Engine {
 
         // Heads-up about the free-account 3 app limit.
         if install {
+            let s2 = src.clone();
+            let ipa_id = tokio::task::spawn_blocking(move || ipa::inspect(&s2).ok().map(|i| i.bundle_id)).await.ok().flatten();
             let st = self.state.lock().unwrap();
             if st.account.as_ref().and_then(|a| a.is_free) == Some(true) {
                 let now = loadside_core::now();
@@ -805,6 +894,8 @@ impl Engine {
                     .iter()
                     .filter(|a| Some(&a.device_udid) == udid.as_ref())
                     .filter(|a| a.on_device != Some(false) && a.expires_at.is_none_or(|e| e > now))
+                    // Updating an app that's already there doesn't take a slot.
+                    .filter(|a| ipa_id.as_deref() != Some(a.original_bundle_id.as_str()))
                     .count();
                 if active >= 3 {
                     let w = "This device already has 3 active apps from Loadside; free accounts allow 3 at a time.".to_string();
@@ -852,7 +943,10 @@ impl Engine {
         };
         let record_id = existing_id.clone().unwrap_or_else(short_id);
         let mut options = p.options.clone();
-        let source_path = if self.config().keep_library_copy {
+        // Files the app staged for this job live in Incoming, which is swept;
+        // an app must never refresh from there, whatever the setting says.
+        let staged = src.starts_with(paths::incoming_dir()) || options.inject.iter().any(|i| i.starts_with(paths::incoming_dir()));
+        let source_path = if self.config().keep_library_copy || staged {
             let (eng, s2, rid, inj) = (self.clone(), src.clone(), record_id.clone(), options.inject.clone());
             let copied = tokio::task::spawn_blocking(move || -> Result<(PathBuf, Vec<PathBuf>)> {
                 Ok((eng.library_copy(&s2, &rid)?, eng.library_inject(&inj, &rid)?))
@@ -864,6 +958,8 @@ impl Engine {
                     path
                 }
                 Ok(Err(e)) => {
+                    // The record then points at the staged files; the sweep and
+                    // the app both leave files an app refers to alone.
                     warn!("Couldn't keep a library copy ({e:#}); refreshes will use the original files");
                     src.clone()
                 }
@@ -922,7 +1018,7 @@ impl Engine {
             // Refreshing under another Apple ID / team would sign a different
             // bundle ID and install a second copy.
             if !rec.team_id.is_empty() || !rec.email.is_empty() {
-                let s = self.session(false).await?;
+                let s = self.session(false, !background).await?;
                 let email_ok = rec.email.is_empty() || rec.email.eq_ignore_ascii_case(&s.email);
                 let team_ok = rec.team_id.is_empty() || rec.team_id == s.team.team_id;
                 if !email_ok || !team_ok {
@@ -945,18 +1041,31 @@ impl Engine {
             self.progress_for(job_id)("Checking device", 0.01);
             // Unattended refreshes must not resurrect an app the user deleted;
             // a click on Refresh/Reinstall should.
+            // Refresh only re-signs what's there: a missing app is reinstalled
+            // only by an explicit Reinstall. Unattended runs also need a
+            // positive answer from the device before they install anything.
             if !reinstall {
-                if let Ok(mut c) = self.connect(&rec.device_udid).await {
-                    if let Ok(set) = c.installed(vec![rec.bundle_id.clone()]).await {
-                        if !set.contains(&rec.bundle_id) {
-                            self.mutate_app(app_id, |a| a.on_device = Some(false));
-                            self.emit_apps();
-                            if background {
-                                return Err(f("not_on_device", "The app was deleted from the device, so it wasn't refreshed.")
-                                    .with_hint("Use Reinstall to put it back, or Remove to forget it."));
-                            }
-                        }
+                let present = tokio::time::timeout(Duration::from_secs(60), async {
+                    match self.connect(&rec.device_udid).await {
+                        Ok(mut c) => c.installed(vec![rec.bundle_id.clone()]).await.ok().map(|set| set.contains(&rec.bundle_id)),
+                        Err(_) => None,
                     }
+                })
+                .await
+                .ok()
+                .flatten();
+                match present {
+                    Some(false) => {
+                        self.mutate_app(app_id, |a| a.on_device = Some(false));
+                        self.emit_apps();
+                        return Err(f("not_on_device", "The app was deleted from the device, so it wasn't refreshed.")
+                            .with_hint("Use Reinstall to put it back, or Remove to forget it."));
+                    }
+                    None if background => {
+                        return Err(f("device_not_found", "Couldn't check the device, so the refresh was skipped.")
+                            .with_hint(crate::checklist::NOT_CONNECTED_HINT));
+                    }
+                    _ => {}
                 }
             }
             let target = self.target(&rec.device_udid);
@@ -1043,19 +1152,42 @@ impl Engine {
 
     pub async fn remove_app(&self, id: &str, uninstall: bool) -> Result<Value, Failure> {
         let rec = self.state.lock().unwrap().app(id).cloned().ok_or_else(|| f("not_found", "Unknown app."))?;
-        // A running refresh would put the app back right after we delete it.
-        if self.job_active_for_app(id) {
-            return Err(f("busy", "This app is being refreshed right now.")
-                .with_hint("Wait for the job to finish (or cancel it in Activity), then remove it."));
+        // Block new jobs for this app first, then check none is running, so a
+        // refresh can't start while we uninstall (and put the app back).
+        {
+            let jobs = self.jobs.lock().unwrap();
+            let mut removing = self.removing.lock().unwrap();
+            if !removing.insert(id.to_string()) {
+                return Err(f("busy", "This app is already being removed."));
+            }
+            if jobs.iter().any(|j| j.app_id.as_deref() == Some(id) && matches!(j.status, JobStatus::Queued | JobStatus::Running)) {
+                removing.remove(id);
+                return Err(f("busy", "This app is being refreshed right now.")
+                    .with_hint("Wait for the job to finish (or cancel it in Activity), then remove it."));
+            }
         }
+        let r = self.remove_app_inner(id, &rec, uninstall).await;
+        self.removing.lock().unwrap().remove(id);
+        r
+    }
+
+    async fn remove_app_inner(&self, id: &str, rec: &AppRecord, uninstall: bool) -> Result<Value, Failure> {
         if uninstall {
-            let mut c = self.connect(&rec.device_udid).await?;
-            if let Err(e) = c.uninstall(&rec.bundle_id).await {
-                let fl = errors::explain(&e);
-                // Already gone is fine.
-                if !fl.detail.as_deref().unwrap_or("").contains("not installed") {
-                    return Err(fl);
+            let res = tokio::time::timeout(Duration::from_secs(90), async {
+                let mut c = self.connect(&rec.device_udid).await?;
+                if let Err(e) = c.uninstall(&rec.bundle_id).await {
+                    let fl = errors::explain(&e);
+                    // Already gone is fine.
+                    if !fl.detail.as_deref().unwrap_or("").contains("not installed") {
+                        return Err(fl);
+                    }
                 }
+                Ok(())
+            })
+            .await;
+            match res {
+                Ok(r) => r?,
+                Err(_) => return Err(f("timeout", "The device didn't answer in time, so the app wasn't removed.").with_hint(crate::checklist::NOT_CONNECTED_HINT)),
             }
             info!("Uninstalled {}", rec.bundle_id);
         }
@@ -1149,6 +1281,25 @@ impl Engine {
         for d in &raw {
             map.insert(d.udid.clone(), device::describe(d).await);
         }
+        // Describing can take seconds per device; devices may have come or
+        // gone meanwhile. Trust a fresh listing for who's here now, and keep
+        // what the attach handler recorded for anything new.
+        if let Ok(now_all) = device::list_all().await {
+            mux = HashMap::new();
+            for d in &now_all {
+                mux.insert(d.device_id, (d.udid.clone(), if matches!(d.connection_type, loadside_core::idevice::usbmuxd::Connection::Network(_)) { "wifi".into() } else { "usb".into() }));
+            }
+            let present: std::collections::HashSet<String> = now_all.iter().map(|d| d.udid.clone()).collect();
+            let current = self.devices.lock().unwrap().clone();
+            map.retain(|u, _| present.contains(u));
+            for u in &present {
+                if !map.contains_key(u) {
+                    if let Some(d) = current.get(u) {
+                        map.insert(u.clone(), d.clone());
+                    }
+                }
+            }
+        }
         *self.devices.lock().unwrap() = map;
         *self.mux.lock().unwrap() = mux;
         let list = self.devices();
@@ -1198,16 +1349,32 @@ impl Engine {
 
     /// Update `on_device` for our records on this device.
     pub(crate) async fn sync_on_device(&self, udid: &str) {
+        let started = loadside_core::now();
         let ids: Vec<String> = self.state.lock().unwrap().apps.iter().filter(|a| a.device_udid == udid).map(|a| a.bundle_id.clone()).collect();
         if ids.is_empty() {
             return;
         }
-        let Ok(mut c) = self.connect(udid).await else { return };
-        let Ok(set) = c.installed(ids).await else { return };
+        let queried = ids.clone();
+        let Ok(Some(set)) = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut c = self.connect(udid).await.ok()?;
+            c.installed(ids).await.ok()
+        })
+        .await
+        else {
+            return;
+        };
         let mut changed = false;
         {
             let mut st = self.state.lock().unwrap();
-            for a in st.apps.iter_mut().filter(|a| a.device_udid == udid) {
+            // Only records we asked about, and not ones an install or refresh
+            // touched while the query ran (the answer may predate them).
+            let busy: Vec<String> = st.apps.iter().filter(|a| self.job_active_for_app(&a.id)).map(|a| a.id.clone()).collect();
+            for a in st.apps.iter_mut().filter(|a| {
+                a.device_udid == udid
+                    && queried.contains(&a.bundle_id)
+                    && a.last_refreshed_at.unwrap_or(a.installed_at) < started
+                    && !busy.contains(&a.id)
+            }) {
                 let now_on = Some(set.contains(&a.bundle_id));
                 if a.on_device != now_on {
                     a.on_device = now_on;
@@ -1241,6 +1408,7 @@ impl Engine {
             let interval = self.config().check_interval_minutes as i64 * 60;
             let deadline = loadside_core::now() + interval;
             self.next_check_at.store(deadline, Ordering::Relaxed);
+            self.emit(Event::Schedule { next_check_at: Some(deadline) });
             // Wait by the wall clock: tokio's timer stops while the Mac sleeps,
             // so one long sleep would run the check hours late after a night
             // asleep. Short ticks catch up within a minute of waking.
@@ -1259,6 +1427,8 @@ impl Engine {
                 }
             }
             self.check_refreshes();
+            // A daemon can run for months: keep hand-off folders tidy too.
+            self.sweep_staging(Duration::from_secs(3 * 24 * 3600));
         }
     }
 
@@ -1270,7 +1440,8 @@ impl Engine {
         let now = loadside_core::now();
         let threshold = cfg.refresh_threshold_hours as i64 * 3600;
         // Waiting for the user to sign in again: queuing jobs would just fail.
-        if self.needs_interactive_login.load(Ordering::SeqCst) && !self.prompts.has_interactive_client() {
+        // Background work never prompts, so an open window doesn't help here.
+        if self.needs_interactive_login.load(Ordering::SeqCst) {
             return vec![];
         }
         let st = self.state.lock().unwrap();
@@ -1288,9 +1459,11 @@ impl Engine {
             })
             .filter(|a| {
                 // Backoff after failures: 30m, 1h, 2h, 4h ... capped at 12h.
+                // Transient misses (device away, sign-in needed) don't count
+                // as failures and only wait a few minutes.
                 let Some(last) = a.last_attempt_at else { return true };
                 let backoff = match a.consecutive_failures {
-                    0 => 1800,
+                    0 => 300,
                     n => (1800i64 << (n - 1).min(5)).min(12 * 3600),
                 };
                 now - last > backoff
@@ -1311,7 +1484,16 @@ impl Engine {
     }
 
     pub fn refresh_all(&self) -> Vec<String> {
-        let ids: Vec<String> = self.state.lock().unwrap().apps.iter().filter(|a| self.device_connected(&a.device_udid)).map(|a| a.id.clone()).collect();
+        // Apps deleted from their device stay deleted: only Reinstall brings one back.
+        let ids: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .apps
+            .iter()
+            .filter(|a| a.on_device != Some(false) && self.device_connected(&a.device_udid))
+            .map(|a| a.id.clone())
+            .collect();
         ids.into_iter().filter_map(|id| self.enqueue(JobSpec::Refresh { app_id: id, reinstall: false }, false).ok()).collect()
     }
 
@@ -1344,6 +1526,7 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move { engine.invalidate_session().await });
         }
+        self.emit(Event::Config { config: new.clone() });
         self.trigger_check();
         Ok(json!(new))
     }

@@ -29,6 +29,7 @@ ruzstd = "0.8"
 lzma-rs = "0.3"
 async-trait = "0.1"
 libc = "0.2"
+url = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy"] }
 
 [dev-dependencies]

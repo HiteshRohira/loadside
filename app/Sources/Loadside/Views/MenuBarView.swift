@@ -7,6 +7,10 @@ struct MenuBarView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { _ in panel }
+    }
+
+    private var panel: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
@@ -145,6 +149,7 @@ struct MenuBarView: View {
     }
 
     private func open(_ target: String?) {
+        AppDelegate.startHidden = false
         NSApp.setActivationPolicy(.regular)
         if !NSApp.windows.contains(where: { $0.identifier?.rawValue.hasPrefix("main") == true && $0.isVisible }) {
             openWindow(id: "main")
@@ -186,7 +191,8 @@ struct MenuBarLabel: View {
     var body: some View {
         let busy = !store.activeJobs.isEmpty
         let attention = store.connection != .connected || (store.setup?.checks.contains(where: \.isBlocking) ?? false)
-            || store.apps.contains { ($0.expiresAt ?? .max) < Int(Date().timeIntervalSince1970) + 24 * 3600 }
+            // Apps deleted from the device aren't refreshed on purpose: no alarm.
+            || store.apps.contains { $0.onDevice != false && ($0.expiresAt ?? .max) < Int(Date().timeIntervalSince1970) + 24 * 3600 }
         // Same glyph as the app icon; a dot means something needs a look.
         // (Progress shows in the panel, not by swapping the icon.)
         Image(nsImage: IconArt.menuBarImage(attention: attention && !busy))

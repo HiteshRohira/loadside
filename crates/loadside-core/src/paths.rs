@@ -10,7 +10,23 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub fn home() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"))
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    // No HOME (a stripped environment): ask the user database. Never fall
+    // back to a shared directory like /tmp.
+    unsafe {
+        let pw = libc::getpwuid(libc::geteuid());
+        if !pw.is_null() && !(*pw).pw_dir.is_null() {
+            let dir = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
+            if !dir.is_empty() {
+                return PathBuf::from(dir);
+            }
+        }
+    }
+    panic!("can't find the home directory (HOME is unset and the user database has none)");
 }
 
 pub fn socket_path() -> PathBuf {

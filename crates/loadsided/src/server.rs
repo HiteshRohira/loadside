@@ -71,10 +71,21 @@ async fn connection(engine: Arc<Engine>, stream: UnixStream) {
     let mut subscribed = false;
     let mut _guard: Option<InteractiveGuard> = None;
     let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
+    // Set when the client missed events: close so it reconnects and gets a
+    // fresh snapshot, instead of waiting forever on an event it never sees.
+    let kill = std::sync::Arc::new(tokio::sync::Notify::new());
 
     loop {
         let mut buf = Vec::new();
-        match (&mut reader).take(MAX_REQUEST_BYTES + 1).read_until(b'\n', &mut buf).await {
+        let mut limited = (&mut reader).take(MAX_REQUEST_BYTES + 1);
+        let read = tokio::select! {
+            r = limited.read_until(b'\n', &mut buf) => r,
+            _ = kill.notified() => {
+                warn!("IPC client fell behind on events; closing its connection");
+                break;
+            }
+        };
+        match read {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -103,6 +114,7 @@ async fn connection(engine: Arc<Engine>, stream: UnixStream) {
                 }
                 let mut brx = engine.events.subscribe();
                 let tx2 = tx.clone();
+                let kill2 = kill.clone();
                 forwarder = Some(tokio::spawn(async move {
                     loop {
                         match brx.recv().await {
@@ -110,10 +122,14 @@ async fn connection(engine: Arc<Engine>, stream: UnixStream) {
                                 // A client that stops reading gets disconnected
                                 // instead of growing an unbounded queue.
                                 if tx2.try_send(encode(&ServerMessage::Event { event })).is_err() {
+                                    kill2.notify_one();
                                     break;
                                 }
                             }
-                            Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Lagged(_)) => {
+                                kill2.notify_one();
+                                break;
+                            }
                             Err(RecvError::Closed) => break,
                         }
                     }
@@ -233,7 +249,11 @@ async fn dispatch(engine: &Arc<Engine>, method: &str, p: Value) -> Result<Value,
         "set_config" => engine.set_config(p.get("config").cloned().unwrap_or(p)),
         "reset_anisette" => {
             let cfg = engine.config();
-            loadside_core::account::reset_anisette(&cfg).map_err(|e| loadside_core::errors::explain(&e))?;
+            // Keychain access can block on a system dialog: keep it off the runtime.
+            tokio::task::spawn_blocking(move || loadside_core::account::reset_anisette(&cfg))
+                .await
+                .map_err(|e| loadside_core::errors::explain(&anyhow::anyhow!(e.to_string())))?
+                .map_err(|e| loadside_core::errors::explain(&e))?;
             Ok(Value::Null)
         }
         "setup_status" => Ok(json!(engine.setup_status(p.get("force").and_then(Value::as_bool).unwrap_or(false)).await)),

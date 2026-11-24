@@ -28,7 +28,7 @@ struct SettingsView: View {
     }
 }
 
-private func configBinding(_ store: Store, _ kp: KeyPath<DaemonConfig, Bool>, _ key: String) -> Binding<Bool> {
+@MainActor private func configBinding(_ store: Store, _ kp: KeyPath<DaemonConfig, Bool>, _ key: String) -> Binding<Bool> {
     Binding(get: { store.config?[keyPath: kp] ?? false }, set: { v in Task { await store.setConfig([key: .bool(v)]) } })
 }
 
@@ -36,6 +36,7 @@ struct GeneralSettings: View {
     @Environment(Store.self) private var store
     @AppStorage(Prefs.menuBar) private var showMenuBar = true
     @State private var checking = false
+    @State private var loginItemError: String?
 
     var body: some View {
         Form {
@@ -74,6 +75,9 @@ struct GeneralSettings: View {
             }
             Section {
                 Toggle("Show Loadside in the menu bar", isOn: $showMenuBar)
+                if let err = loginItemError {
+                    Label(err, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
+                }
             } header: {
                 Text("Menu bar")
             } footer: {
@@ -81,6 +85,11 @@ struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { loginItemError = LoginItem.lastError }
+        .onChange(of: showMenuBar) { _, on in
+            LoginItem.sync(enabled: on)
+            loginItemError = LoginItem.lastError
+        }
     }
 }
 
@@ -224,9 +233,14 @@ struct AdvancedSettings: View {
 
 /// Show the main window (creating it if it was closed).
 @MainActor func bringMainWindowForward() {
+    AppDelegate.startHidden = false
     NSApp.setActivationPolicy(.regular)
-    if let w = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("main") == true }) {
+    if let w = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("main") == true && ($0.isVisible || $0.isMiniaturized) }) {
+        if w.isMiniaturized { w.deminiaturize(nil) }
         w.makeKeyAndOrderFront(nil)
+    } else {
+        // SwiftUI disposes of a closed window; ask it for a new one.
+        AppDelegate.openMainWindow?()
     }
     NSApp.activate(ignoringOtherApps: true)
 }

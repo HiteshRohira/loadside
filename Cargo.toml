@@ -24,3 +24,7 @@ lto = "thin"
 codegen-units = 4
 strip = true
 panic = "unwind"
+
+# Timeouts and a busy-loop fix; see third_party/isideload/LOADSIDE_PATCHES.md.
+[patch.crates-io]
+isideload = { path = "third_party/isideload" }

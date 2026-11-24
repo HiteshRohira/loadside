@@ -118,10 +118,15 @@ pub fn inspect(path: &Path) -> Result<IpaInfo> {
         bail!("not a valid IPA: too many files ({})", zip.len());
     }
     let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let mut plist_bytes: u64 = 0;
     for name in &names {
         let Some((kind, app)) = classify_plist(name) else { continue };
         let mut buf = Vec::new();
         zip.by_name(name)?.take(MAX_PLIST_BYTES).read_to_end(&mut buf)?;
+        plist_bytes += buf.len() as u64;
+        if plist_bytes > 4 * MAX_PLIST_BYTES {
+            bail!("not a valid IPA: too many or too large Info.plist files");
+        }
         let dict: plist::Dictionary = plist::from_bytes(&buf).with_context(|| format!("parsing {name}"))?;
         if kind == "main" {
             if main.is_some() {
@@ -155,6 +160,12 @@ fn stream_encryption(mut r: impl Read) -> Result<bool> {
         return macho::is_encrypted_from_prefixes(&[head]);
     }
     layout.sort();
+    // Slice offsets come from the (untrusted) header; don't decompress more
+    // than a real binary could hold just to reach them.
+    const MAX_SKIP: u64 = 2 * 1024 * 1024 * 1024;
+    if layout.iter().any(|(off, _)| *off > MAX_SKIP) {
+        bail!("fat slice offset out of range");
+    }
     let mut pos = head.len() as u64;
     let mut prefixes = Vec::new();
     for (off, size) in layout {
@@ -174,15 +185,34 @@ fn read_plist(p: &Path) -> Result<plist::Dictionary> {
     plist::from_file(p).with_context(|| format!("parsing {}", p.display()))
 }
 
+/// Open a file inside an untrusted bundle: a regular file (not a link, FIFO
+/// or device) no bigger than `max`.
+fn open_regular(p: &Path, max: u64) -> Result<std::fs::File> {
+    let m = std::fs::symlink_metadata(p).with_context(|| format!("reading {}", p.display()))?;
+    if !m.file_type().is_file() {
+        return Err(bad_bundle(format!("{} is not a regular file.", p.display())));
+    }
+    if m.len() > max {
+        return Err(bad_bundle(format!("{} is too large.", p.display())));
+    }
+    Ok(std::fs::File::open(p)?)
+}
+
+fn read_plist_untrusted(p: &Path) -> Result<plist::Dictionary> {
+    let mut buf = Vec::new();
+    open_regular(p, MAX_PLIST_BYTES)?.take(MAX_PLIST_BYTES).read_to_end(&mut buf)?;
+    plist::from_bytes(&buf).with_context(|| format!("parsing {}", p.display()))
+}
+
 fn inspect_app_dir(app: &Path) -> Result<IpaInfo> {
-    let main = read_plist(&app.join("Info.plist")).context("not a valid app bundle")?;
+    let main = read_plist_untrusted(&app.join("Info.plist")).context("not a valid app bundle")?;
     let mut subs = Vec::new();
     for (dir, kind, ext) in [("PlugIns", "extension", "appex"), ("Watch", "watch", "app")] {
         let Ok(rd) = std::fs::read_dir(app.join(dir)) else { continue };
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().is_some_and(|x| x == ext) {
-                if let Ok(d) = read_plist(&p.join("Info.plist")) {
+                if let Ok(d) = read_plist_untrusted(&p.join("Info.plist")) {
                     subs.push((kind.to_string(), d));
                 }
             }
@@ -190,7 +220,7 @@ fn inspect_app_dir(app: &Path) -> Result<IpaInfo> {
     }
     let exe = plist_str(&main, "CFBundleExecutable").unwrap_or_default();
     let encrypted = if valid_file_name(&exe) {
-        std::fs::File::open(app.join(&exe)).ok().and_then(|f| stream_encryption(f).ok())
+        open_regular(&app.join(&exe), MAX_TOTAL_BYTES).ok().and_then(|f| stream_encryption(f).ok())
     } else {
         None
     };
@@ -350,17 +380,51 @@ fn extract_zip(zip: &mut zip::ZipArchive<std::fs::File>, work: &Path) -> Result<
         }
         if let Some(mode) = f.unix_mode() {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode & 0o755));
+            // Keep the owner's read/write bits: signing rewrites Info.plist and binaries.
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode((mode & 0o755) | 0o600));
         }
     }
     for (target, at) in links {
+        // An absolute target can only point outside the bundle.
+        if target.is_absolute() || target.as_os_str().is_empty() {
+            return Err(bad_bundle(format!("{} links outside the app.", rel(work, &at))));
+        }
+        // Never create, delete or link *through* an earlier link: a chain like
+        // "a -> /elsewhere" then "a/b" would otherwise touch files outside
+        // `work` before verify_tree gets a chance to reject the archive.
+        ensure_real_dirs(work, &at)?;
         if let Some(parent) = at.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _ = std::fs::remove_file(&at);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.is_dir() => return Err(bad_bundle(format!("{} is both a folder and a link.", rel(work, &at)))),
+            Ok(_) => std::fs::remove_file(&at)?,
+            Err(_) => {}
+        }
         std::os::unix::fs::symlink(target, &at)?;
     }
     verify_tree(work)
+}
+
+/// Every existing ancestor of `at` below `root` must be a real directory.
+fn ensure_real_dirs(root: &Path, at: &Path) -> Result<()> {
+    let relp = at.strip_prefix(root).map_err(|_| bad_bundle("Archive entry points outside the archive."))?;
+    let comps: Vec<_> = relp.components().collect();
+    let mut cur = root.to_path_buf();
+    for c in comps.iter().take(comps.len().saturating_sub(1)) {
+        match c {
+            std::path::Component::Normal(n) => cur.push(n),
+            _ => return Err(bad_bundle("Archive entry points outside the archive.")),
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(bad_bundle(format!("{} goes through a link.", rel(root, at))));
+            }
+            Ok(m) if !m.is_dir() => return Err(bad_bundle(format!("{} is inside a file.", rel(root, at)))),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Apps that `isideload` hands your signing certificate *and private key*
@@ -810,6 +874,50 @@ mod tests {
             d.insert((*k).into(), (*v).into());
         }
         plist::to_file_xml(p, &d).unwrap();
+    }
+
+    /// A link to the outside followed by an entry *under* that link must not
+    /// create, delete or link anything outside the extraction directory.
+    #[test]
+    fn chained_symlinks_cannot_escape() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let dir = std::env::temp_dir().join(format!("ls-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), "keep me").unwrap();
+        let ipa = dir.join("evil.ipa");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&ipa).unwrap());
+            let o = SimpleFileOptions::default();
+            z.add_symlink("Payload/A.app/esc", outside.to_str().unwrap(), o).unwrap();
+            z.add_symlink("Payload/A.app/esc/victim", "x", o).unwrap();
+            z.start_file("Payload/A.app/Info.plist", o).unwrap();
+            z.write_all(b"<plist/>").unwrap();
+            z.finish().unwrap();
+        }
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&ipa).unwrap()).unwrap();
+        assert!(extract_zip(&mut zip, &work).is_err());
+        assert_eq!(std::fs::read_to_string(outside.join("victim")).unwrap(), "keep me");
+        assert!(std::fs::symlink_metadata(outside.join("victim")).unwrap().is_file());
+        // Same chain with a relative escape.
+        let ipa2 = dir.join("evil2.ipa");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&ipa2).unwrap());
+            let o = SimpleFileOptions::default();
+            z.add_symlink("Payload/A.app/esc", "../../../outside", o).unwrap();
+            z.add_symlink("Payload/A.app/esc/victim", "x", o).unwrap();
+            z.finish().unwrap();
+        }
+        let work2 = dir.join("work2");
+        std::fs::create_dir_all(&work2).unwrap();
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&ipa2).unwrap()).unwrap();
+        assert!(extract_zip(&mut zip, &work2).is_err());
+        assert!(std::fs::symlink_metadata(outside.join("victim")).unwrap().is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Build Payload/Demo.app with an extension and a watch app, zipped as an IPA.

@@ -75,19 +75,58 @@ impl<S: tracing::Subscriber> Layer<S> for BufferLayer {
     }
 }
 
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// The log file, rotated to `.log.1` whenever it passes 5 MB (not just at
+/// startup: the daemon can run for months).
+struct RotatingLog {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    size: u64,
+}
+
+impl RotatingLog {
+    fn open(path: std::path::PathBuf) -> Self {
+        let mut me = RotatingLog { path, file: None, size: 0 };
+        me.reopen();
+        me
+    }
+
+    fn reopen(&mut self) {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        self.file = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&self.path).ok();
+        // Older files may have been created world-readable.
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        self.size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+    }
+}
+
+impl std::io::Write for RotatingLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.size > MAX_LOG_BYTES {
+            self.file = None;
+            let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+            self.reopen();
+        }
+        match self.file.as_mut() {
+            Some(f) => {
+                let n = f.write(buf)?;
+                self.size += n as u64;
+                Ok(n)
+            }
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), |f| f.flush())
+    }
+}
+
 pub fn init(foreground: bool) -> Arc<LogBuffer> {
     let buffer = Arc::new(LogBuffer::default());
     let path = loadside_core::paths::log_file();
-    if std::fs::metadata(&path).map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false) {
-        let _ = std::fs::rename(&path, path.with_extension("log.1"));
-    }
-    let file = {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path).ok();
-        // Older files may have been created world-readable.
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        f
-    };
+    let file = Some(RotatingLog::open(path));
     let filter = || {
         EnvFilter::try_from_env("LOADSIDE_LOG")
             .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,reqwest=warn,rustls=warn,idevice=warn,tungstenite=warn,tokio_tungstenite=warn"))

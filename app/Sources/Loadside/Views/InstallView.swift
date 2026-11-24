@@ -16,6 +16,8 @@ struct InstallSheet: View {
     @State private var busy = false
     @State private var showOptions = false
     @State private var dropTargeted = false
+    /// The device the user had chosen, if it went away (never switch silently).
+    @State private var lostDevice: (udid: String, name: String)?
 
     /// Apps that refresh themselves with your signing key (see daemon).
     private static let keyReceivers: Set<String> = ["com.rileytestut.AltStore", "com.SideStore.SideStore", "app.stik.store", "com.kdt.livecontainer"]
@@ -42,8 +44,19 @@ struct InstallSheet: View {
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted, perform: handleDrop)
         .task { await load() }
         .onAppear { if deviceUdid.isEmpty { deviceUdid = store.devices.first?.udid ?? "" } }
-        .onChange(of: store.devices) { _, devs in
-            if !devs.contains(where: { $0.udid == deviceUdid }) { deviceUdid = devs.first?.udid ?? "" }
+        .onChange(of: store.devices) { old, devs in
+            if let lost = lostDevice, devs.contains(where: { $0.udid == lost.udid }) {
+                // It came back.
+                deviceUdid = lost.udid
+                lostDevice = nil
+            } else if !deviceUdid.isEmpty, !devs.contains(where: { $0.udid == deviceUdid }) {
+                // The chosen device went away: ask again instead of quietly
+                // installing on another one.
+                lostDevice = (deviceUdid, old.first { $0.udid == deviceUdid }?.name ?? "The device")
+                deviceUdid = ""
+            } else if deviceUdid.isEmpty, lostDevice == nil, let first = devs.first {
+                deviceUdid = first.udid
+            }
         }
         .onDisappear(perform: cleanUp)
     }
@@ -60,6 +73,7 @@ struct InstallSheet: View {
                 }
                 if let e = job?.error { FailureView(failure: e) }
                 deviceRow
+                slotsRow
                 budgetRow
                 if needsKeyConsent { keyConsent }
                 optionsDisclosure
@@ -98,8 +112,25 @@ struct InstallSheet: View {
 
     @ViewBuilder private var deviceRow: some View {
         HStack(spacing: 10) {
-            Image(systemName: store.devices.isEmpty ? "iphone.slash" : "iphone").frame(width: 20).foregroundStyle(.secondary)
-            if store.devices.isEmpty {
+            Image(systemName: store.devices.isEmpty || deviceUdid.isEmpty ? "iphone.slash" : "iphone").frame(width: 20).foregroundStyle(.secondary)
+            if let lost = lostDevice, deviceUdid.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(lost.name) disconnected").font(.callout.weight(.medium))
+                    Text(store.devices.isEmpty ? "Unlock it on the same Wi-Fi, or plug it in." : "Wait for it, or choose another device.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if store.devices.isEmpty {
+                    Button("Look Again") { Task { await store.refreshDevices() } }.controlSize(.small)
+                } else {
+                    Menu("Choose…") {
+                        ForEach(store.devices) { d in
+                            Button("\(d.name) · \(d.connectionLabel)") { deviceUdid = d.udid; lostDevice = nil }
+                        }
+                    }
+                    .fixedSize()
+                }
+            } else if store.devices.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("No device connected").font(.callout.weight(.medium))
                     Text("Unlock your iPhone on the same Wi-Fi, or plug it in.").font(.caption).foregroundStyle(.secondary)
@@ -125,26 +156,61 @@ struct InstallSheet: View {
     private struct NeededId {
         var label: String
         var isExtension: Bool
-        /// The spellings it may be registered under: the main app as
-        /// "<id>.<TEAM>", extensions as "<id>.<TEAM>.<suffix>" (how the signer
-        /// registers them).
-        var forms: [String]
+        /// Exactly what the signer registers: "<id>.<TEAM>" for the app and
+        /// "<id>.<TEAM>.<rest>" for each extension (isideload), after
+        /// Loadside's own extension renaming (ipa.rs `prepare`).
+        var identifier: String
     }
 
     private func neededIdentifiers(_ i: IpaInfo) -> [NeededId] {
         let team = store.account?.teamId ?? ""
-        let base = options.bundleId.flatMap { $0.isEmpty ? nil : $0 } ?? i.bundleId
-        var ids = [NeededId(label: options.displayName ?? i.name, isExtension: false, forms: [base, "\(base).\(team)"])]
-        if options.extensions == .registerAll {
-            for ext in i.subBundles where ext.kind == "extension" {
-                let suffix = ext.bundleId.hasPrefix(i.bundleId + ".")
-                    ? String(ext.bundleId.dropFirst(i.bundleId.count))
-                    : "." + (ext.bundleId.split(separator: ".").last.map(String.init) ?? "ext")
-                ids.append(NeededId(label: ExtensionName.friendly(ext.bundleId), isExtension: true,
-                                    forms: [base + suffix, "\(base).\(team)\(suffix)", "\(base)\(suffix).\(team)"]))
+        let custom = options.bundleId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let base = custom.isEmpty ? i.bundleId : custom
+        let registered = { (id: String) in "\(base).\(team)" + id.dropFirst(base.count) }
+        var ids = [NeededId(label: options.displayName ?? i.name, isExtension: false, identifier: "\(base).\(team)")]
+        guard options.extensions == .registerAll else { return ids }
+        var used = [base]
+        for ext in i.subBundles where ext.kind == "extension" {
+            var fixed: String
+            if ext.bundleId.hasPrefix(i.bundleId + ".") {
+                fixed = base + ext.bundleId.dropFirst(i.bundleId.count)
+            } else if ext.bundleId.hasPrefix(base + ".") {
+                fixed = ext.bundleId
+            } else {
+                fixed = base + "." + (ext.bundleId.split(separator: ".").last.map(String.init) ?? "ext")
             }
+            if used.contains(fixed) {
+                let stem = fixed
+                var n = 2
+                while used.contains(fixed) { fixed = "\(stem)\(n)"; n += 1 }
+            }
+            used.append(fixed)
+            ids.append(NeededId(label: ExtensionName.friendly(ext.bundleId), isExtension: true, identifier: registered(fixed)))
         }
         return ids
+    }
+
+    /// Free accounts keep 3 sideloaded apps per device. Installing a 4th
+    /// would spend App IDs and then fail on the device, so stop it here.
+    /// (Updating an app that's already there doesn't take a new slot.)
+    private var slotsFull: Bool {
+        guard store.account?.isFree == true, !deviceUdid.isEmpty, let i = inspect?.info else { return false }
+        let others = store.activeApps(on: deviceUdid).filter { $0.originalBundleId != i.bundleId }
+        return others.count >= Store.freeSlotsPerDevice
+    }
+
+    @ViewBuilder private var slotsRow: some View {
+        if slotsFull {
+            let name = store.devices.first { $0.udid == deviceUdid }?.name ?? "This device"
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: "exclamationmark.circle.fill").frame(width: 20).foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(name) already has 3 apps from Loadside").font(.callout.weight(.medium)).foregroundStyle(.orange)
+                    Text("Free Apple IDs allow 3 sideloaded apps per device. Remove one first (open it on the home screen, then Remove).")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
     }
 
     /// "widget" when every extension is a widget, else "extension".
@@ -158,8 +224,7 @@ struct InstallSheet: View {
     @ViewBuilder private var budgetRow: some View {
         if let i = inspect?.info, let avail = store.appIds?.availableQuantity, store.account?.isFree != false {
             let registered = Set(store.appIds?.appIds.map(\.identifier) ?? [])
-            // An ID counts as existing only on an exact match of one of its spellings.
-            let missing = neededIdentifiers(i).filter { n in !n.forms.contains(where: registered.contains) }
+            let missing = neededIdentifiers(i).filter { !registered.contains($0.identifier) }
             let missingExt = missing.filter(\.isExtension)
             let allExt = i.subBundles.filter { $0.kind == "extension" }.map { ExtensionName.friendly($0.bundleId) }
             let short = missing.count > avail
@@ -249,7 +314,9 @@ struct InstallSheet: View {
                     Toggle("Refresh automatically before it expires", isOn: $options.autoRefresh)
                     Toggle("Allow on any device model", isOn: $options.removeSupportedDevices)
                     if inspect?.info.hasWatchApp == true {
-                        Toggle("Remove the Apple Watch app", isOn: $options.stripWatchApp)
+                        // The signer can't sign Watch apps, so they're always removed.
+                        Label("The Apple Watch app is left out (it can't be signed).", systemImage: "applewatch.slash")
+                            .font(.callout).foregroundStyle(.secondary)
                     }
                     Toggle("Show the app's files in Files and Finder", isOn: $options.fileSharing)
                     Toggle("Request increased memory limit", isOn: $options.increasedMemoryLimit)
@@ -320,7 +387,7 @@ struct InstallSheet: View {
                 Text(job.kind == .export ? "Signing \(name)…" : "Installing \(name)…").font(.title3.weight(.semibold))
                 JobProgressView(job: job).frame(width: 320)
             case .succeeded:
-                Text(job.kind == .export ? "Signed IPA saved" : "\(name) is installed").font(.title3.weight(.semibold))
+                Text(job.kind == .export ? (store.exportErrors[job.id] == nil ? "Signed IPA saved" : "Couldn't save the signed IPA") : "\(name) is installed").font(.title3.weight(.semibold))
                 Text(successNote(job)).font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 400)
                     .fixedSize(horizontal: false, vertical: true)
@@ -338,7 +405,7 @@ struct InstallSheet: View {
     }
 
     private func successNote(_ job: JobInfo) -> String {
-        if job.kind == .export { return "Saved where you chose." }
+        if job.kind == .export { return store.exportErrors[job.id] ?? "Saved where you chose." }
         if let dev = store.devices.first(where: { $0.udid == job.deviceUdid }), dev.developerMode == false {
             return "Before opening it, turn on Developer Mode on \(dev.name): Settings → Privacy & Security → Developer Mode, then restart."
         }
@@ -369,7 +436,7 @@ struct InstallSheet: View {
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                     .disabled(inspect == nil)
                 Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction).disabled(busy)
                 Button {
                     Task { await install() }
                 } label: {
@@ -377,7 +444,7 @@ struct InstallSheet: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .primaryButton()
-                .disabled(!canSign || deviceUdid.isEmpty || busy)
+                .disabled(!canSign || deviceUdid.isEmpty || busy || slotsFull)
             }
         }
         .controlSize(.large)
@@ -397,24 +464,33 @@ struct InstallSheet: View {
 
     private func load() async {
         do {
+            // Opening an IPA can launch Loadside: give the background service
+            // a moment to connect before asking it anything.
+            for _ in 0..<75 where store.connection != .connected {
+                try await Task.sleep(for: .milliseconds(200))
+            }
             // Hand the daemon a copy inside Loadside's own folder.
             let s = try await Store.stage(source)
             staged = s.path
+            store.liveStaging.insert(s.path)
             inspect = try await store.inspect(path: s.path, options: options)
-            if store.account?.isFree == true && store.appIds == nil { await store.loadAppIds() }
+            // Always fresh: App IDs expire, and another tool may have added some.
+            if store.account?.isFree == true { await store.loadAppIds() }
         } catch {
             inspectError = (error as? Failure) ?? Failure.local(error.localizedDescription)
         }
     }
 
-    /// Drop the staged copy unless the daemon still needs it: a running job
-    /// reads it, and without a library copy the app record points at it.
+    /// Drop the staged copies unless something still needs them: a job that
+    /// is running (or being submitted) drops them itself when it ends, and an
+    /// installed app may refresh from them (Store.unstageIfUnused checks).
     private func cleanUp() {
-        if let job, job.isActive { return }
-        if job?.status == .succeeded, job?.kind == .install, store.config?.keepLibraryCopy != true { return }
-        if let staged { Store.unstage(staged) }
-        for p in options.inject { Store.unstage(p) }
+        if let staged { store.liveStaging.remove(staged) }
+        if busy || (job?.isActive ?? false) { return }
+        for p in [staged].compactMap({ $0 }) + options.inject { store.unstageIfUnused(p) }
     }
+
+    private var stagedInputs: [String] { [staged].compactMap { $0 } + options.inject }
 
     private func chooseOther() {
         let panel = NSOpenPanel()
@@ -434,10 +510,13 @@ struct InstallSheet: View {
     }
 
     private func addTweak(_ url: URL) {
+        if options.inject.contains(where: { URL(fileURLWithPath: $0).lastPathComponent == url.lastPathComponent }) { return }
         Task {
             do {
                 let s = try await Store.stage(url)
-                if !options.inject.contains(where: { URL(fileURLWithPath: $0).lastPathComponent == url.lastPathComponent }) {
+                if options.inject.contains(where: { URL(fileURLWithPath: $0).lastPathComponent == url.lastPathComponent }) {
+                    Store.unstage(s.path)
+                } else {
                     options.inject.append(s.path)
                     showOptions = true
                 }
@@ -467,9 +546,11 @@ struct InstallSheet: View {
         guard let staged else { return }
         busy = true
         defer { busy = false }
+        let inputs = stagedInputs
         jobId = await store.run {
             try await store.install(InstallParams(path: staged, deviceUdid: deviceUdid, options: options, exportPath: nil, install: true))
         }
+        if let jobId { store.unstageWhenDone(job: jobId, paths: inputs) }
     }
 
     private func export() async {
@@ -482,10 +563,14 @@ struct InstallSheet: View {
         defer { busy = false }
         // The daemon writes into Loadside's folder; the app moves it to `out`.
         guard let staging = try? Store.exportStaging(name: out.lastPathComponent) else { return }
+        let inputs = stagedInputs
         jobId = await store.run {
             try await store.install(InstallParams(path: staged, deviceUdid: deviceUdid.isEmpty ? nil : deviceUdid, options: options, exportPath: staging.path, install: false))
         }
-        if let jobId { store.exportDestinations[jobId] = out }
+        if let jobId {
+            store.exportDestinations[jobId] = out
+            store.unstageWhenDone(job: jobId, paths: inputs)
+        }
     }
 }
 
@@ -501,7 +586,7 @@ private struct PromptPresenter: ViewModifier {
     @Environment(Store.self) private var store
     func body(content: Content) -> some View {
         content.sheet(item: Binding(get: { store.prompts.first }, set: { _ in })) { prompt in
-            PromptSheet(prompt: prompt).environment(store).interactiveDismissDisabled()
+            PromptSheet(prompt: prompt).id(prompt.id).environment(store).interactiveDismissDisabled()
         }
     }
 }

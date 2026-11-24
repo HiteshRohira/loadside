@@ -74,8 +74,8 @@ enum Cmd {
         name: Option<String>,
         #[arg(long, value_enum, default_value_t = ExtArg::Register)]
         extensions: ExtArg,
-        /// Keep the embedded Apple Watch app
-        #[arg(long)]
+        /// No effect: Watch apps can't be signed and are always removed
+        #[arg(long, hide = true)]
         keep_watch: bool,
         /// Keep UISupportedDevices restrictions
         #[arg(long)]
@@ -451,6 +451,9 @@ async fn run(cli: Cli) -> Result<()> {
             path, device, bundle_id, name, extensions, keep_watch, keep_device_restrictions, file_sharing,
             increased_memory_limit, inject, export, no_install, no_auto_refresh, allow_encrypted, allow_signing_key, detach,
         } => {
+            if keep_watch {
+                eprintln!("note: --keep-watch has no effect; Apple Watch apps can't be signed and are always removed");
+            }
             let inject = inject.iter().map(|p| stage(p).map(PathBuf::from)).collect::<Result<Vec<_>>>()?;
             let options = InstallOptions {
                 bundle_id,
@@ -473,15 +476,21 @@ async fn run(cli: Cli) -> Result<()> {
             if !detach {
                 subscribe(&c).await?;
             }
+            let staged_path = stage(&path)?;
+            let mut staged: Vec<PathBuf> = options.inject.clone();
+            staged.push(PathBuf::from(&staged_path));
             let v = call(&c, "install", json!({
-                "path": stage(&path)?, "device_udid": device, "options": options,
+                "path": staged_path, "device_udid": device, "options": options,
                 "export_path": export, "install": !no_install,
             })).await?;
             let job = v["job_id"].as_str().unwrap_or("").to_string();
             if detach {
+                // The daemon sweeps leftovers it no longer needs.
                 println!("Queued job {job}");
             } else {
-                follow_job(&c, &job).await?;
+                let r = follow_job(&c, &job).await;
+                unstage_unused(&c, &staged).await;
+                r?;
             }
         }
         Cmd::Apps => {
@@ -775,6 +784,24 @@ fn stage(p: &Path) -> Result<String> {
     Ok(dst.display().to_string())
 }
 
+/// Remove this command's staged copies (Incoming/<uuid>/) unless an
+/// installed app refreshes from them.
+async fn unstage_unused(c: &Client, staged: &[PathBuf]) {
+    let Ok(v) = call(c, "apps", json!({})).await else { return };
+    let apps: Vec<AppRecord> = serde_json::from_value(v).unwrap_or_default();
+    let incoming = paths::incoming_dir();
+    for p in staged {
+        let Some(dir) = p.parent() else { continue };
+        if dir.parent() != Some(incoming.as_path()) {
+            continue;
+        }
+        let used = apps.iter().any(|a| a.source_path.starts_with(dir) || a.options.inject.iter().any(|i| i.starts_with(dir)));
+        if !used {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 fn fmt_ts(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default()
 }
@@ -941,6 +968,10 @@ async fn daemon_cmd(cmd: &DaemonCmd) -> Result<()> {
             if Client::connect_default().await.is_ok() {
                 bail!("loadsided is still running; quit it with `pkill loadsided`");
             }
+            // The app's menu bar login item would otherwise start Loadside at
+            // the next login, which would reinstall the service.
+            let menubar = plist.with_file_name("dev.loadside.menubar.plist");
+            let _ = std::fs::remove_file(&menubar);
             println!("✓ Background service removed (app, settings and apps list are kept)");
         }
         DaemonCmd::Start => {

@@ -55,7 +55,7 @@ struct ContentView: View {
             AppDetailSheet(appId: box.id).environment(store)
         }
         .sheet(item: Binding(get: { store.showOnboarding || anySheetOpen ? nil : store.prompts.first }, set: { _ in })) { prompt in
-            PromptSheet(prompt: prompt)
+            PromptSheet(prompt: prompt).id(prompt.id)
                 .environment(store)
                 .interactiveDismissDisabled()
         }
@@ -70,12 +70,12 @@ struct ContentView: View {
         .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
         .onOpenURL { url in
             guard url.isFileURL, ["ipa", "app"].contains(url.pathExtension.lowercased()) else { return }
-            pending = PendingInstall(url: url)
+            openInstall(url)
         }
         .onChange(of: store.pendingInstallURL) { _, url in
             guard let url else { return }
             store.pendingInstallURL = nil
-            pending = PendingInstall(url: url)
+            openInstall(url)
         }
     }
 
@@ -115,7 +115,22 @@ struct ContentView: View {
         panel.allowsMultipleSelection = false
         panel.message = "Choose an app to install"
         panel.prompt = "Choose"
-        if panel.runModal() == .OK, let url = panel.url { pending = PendingInstall(url: url) }
+        if panel.runModal() == .OK, let url = panel.url { openInstall(url) }
+    }
+
+    /// Show the install sheet, closing whatever sheet is up first (SwiftUI
+    /// drops a second sheet presented on the same view).
+    private func openInstall(_ url: URL) {
+        AppDelegate.startHidden = false
+        guard anySheetOpen || store.showOnboarding else {
+            pending = PendingInstall(url: url)
+            return
+        }
+        pending = nil
+        showSetup = false
+        detailAppId = nil
+        store.showOnboarding = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { pending = PendingInstall(url: url) }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -125,7 +140,7 @@ struct ContentView: View {
             Task { @MainActor in
                 let ext = url.pathExtension.lowercased()
                 if ext == "ipa" || ext == "app" {
-                    pending = PendingInstall(url: url)
+                    openInstall(url)
                 } else {
                     store.show(Failure.local("That's not an app.", hint: "Drop an .ipa file to install it."))
                 }
@@ -165,6 +180,12 @@ struct HomeView: View {
     private let columns = [GridItem(.adaptive(minimum: 230, maximum: 340), spacing: 16)]
 
     var body: some View {
+        // Re-render every minute so "N days left" and "next check" stay true.
+        TimelineView(.periodic(from: .now, by: 60)) { _ in content }
+            .task(id: store.account?.email) { await store.ensureQuota() }
+    }
+
+    private var content: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 StatusStrip()
@@ -183,7 +204,6 @@ struct HomeView: View {
             .frame(maxWidth: 1000)
             .frame(maxWidth: .infinity)
         }
-        .task(id: store.account?.email) { await store.ensureQuota() }
     }
 
     /// One line about the most important unfinished setup step.
@@ -238,7 +258,8 @@ struct HomeView: View {
     /// Free accounts get 3 apps per device: show the free ones as drop targets.
     private var openSlots: Int {
         guard store.account?.isFree == true, let left = store.freeSlotsLeft else { return 1 }
-        return left
+        // Always leave somewhere to drop an app (apps from other tools aren't counted).
+        return max(1, left)
     }
 }
 

@@ -130,11 +130,50 @@ final class Store {
     /// Remove a staged copy (only ever inside Incoming).
     /// Only the per-file folder `stage` created (Incoming/<uuid>/) is removed.
     nonisolated static func unstage(_ path: String) {
-        let incoming = dataDir.appendingPathComponent("Incoming").standardizedFileURL.path
-        let dir = URL(fileURLWithPath: path).standardizedFileURL.deletingLastPathComponent()
-        guard dir.deletingLastPathComponent().path == incoming, UUID(uuidString: dir.lastPathComponent) != nil else { return }
+        guard let dir = stagingDir(path) else { return }
         try? FileManager.default.removeItem(at: dir)
     }
+
+    /// The Incoming/<uuid>/ folder `stage` made for `path`, if it is one.
+    nonisolated static func stagingDir(_ path: String) -> URL? {
+        let incoming = dataDir.appendingPathComponent("Incoming").standardizedFileURL.path
+        let dir = URL(fileURLWithPath: path).standardizedFileURL.deletingLastPathComponent()
+        guard dir.deletingLastPathComponent().path == incoming, UUID(uuidString: dir.lastPathComponent) != nil else { return nil }
+        return dir
+    }
+
+    /// Unstage, unless an installed app still refreshes from that copy
+    /// (no library copy, or making one failed).
+    func unstageIfUnused(_ path: String) {
+        guard let dir = Self.stagingDir(path)?.path else { return }
+        let used = apps.contains { a in
+            ([a.sourcePath] + a.options.inject).contains { $0 == dir || $0.hasPrefix(dir + "/") }
+        }
+        if !used { Self.unstage(path) }
+    }
+
+    /// Staged files of install sheets that are still open (they may retry).
+    var liveStaging: Set<String> = []
+    /// job id → staged inputs to drop once the job is over.
+    private var stagedForJob: [String: [String]] = [:]
+
+    /// Drop a job's staged inputs when it ends: after success they're no
+    /// longer needed; after a failure only if its sheet is gone (else the
+    /// sheet may Try Again, and unstages when it closes).
+    func unstageWhenDone(job id: String, paths: [String]) {
+        stagedForJob[id] = paths
+        if let j = job(id), !j.isActive { jobEnded(j) }
+    }
+
+    private func jobEnded(_ j: JobInfo) {
+        guard let paths = stagedForJob[j.id] else { return }
+        if j.status != .succeeded && paths.contains(where: liveStaging.contains) { return }
+        stagedForJob[j.id] = nil
+        for p in paths { unstageIfUnused(p) }
+    }
+
+    /// Export results the app couldn't save where the user asked.
+    var exportErrors: [String: String] = [:]
 
     /// Where the daemon writes an exported IPA before the app moves it.
     nonisolated static func exportStaging(name: String) throws -> URL {
@@ -150,12 +189,22 @@ final class Store {
         guard let dest = exportDestinations[job.id], let out = job.outputPath else { return }
         exportDestinations[job.id] = nil
         let src = URL(fileURLWithPath: out)
+        let fm = FileManager.default
+        // Copy next to the destination first, then swap it in: the old file
+        // survives anything that fails along the way (a full disk, say).
+        let partial = dest.deletingLastPathComponent().appendingPathComponent(".\(dest.lastPathComponent).\(UUID().uuidString.prefix(8)).partial")
         do {
-            if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
-            try FileManager.default.moveItem(at: src, to: dest)
-            try? FileManager.default.removeItem(at: src.deletingLastPathComponent())
+            try fm.copyItem(at: src, to: partial)
+            if fm.fileExists(atPath: dest.path) {
+                _ = try fm.replaceItemAt(dest, withItemAt: partial)
+            } else {
+                try fm.moveItem(at: partial, to: dest)
+            }
+            try? fm.removeItem(at: src.deletingLastPathComponent())
             exportDestinations[job.id] = dest // remembered for "Show in Finder"
         } catch {
+            try? fm.removeItem(at: partial)
+            exportErrors[job.id] = "It's still at \(out). (\(error.localizedDescription))"
             banner = Banner(title: "Couldn't save the signed IPA", message: "It's at \(out). (\(error.localizedDescription))", isError: true)
         }
     }
@@ -192,17 +241,26 @@ final class Store {
         triedInstallingAgent = true
         bootstrapping = true
         Task.detached {
+            // Already registered with launchd (e.g. still starting up at
+            // login)? Then wait for it instead of reinstalling, which would
+            // restart it.
+            if !force, Self.daemonLoaded() {
+                await MainActor.run { self.bootstrapping = false; self.triedInstallingAgent = false }
+                return
+            }
             let p = Process()
             p.executableURL = cli
             p.arguments = ["daemon", "install", "--bin", daemon.path]
             let errPipe = Pipe()
             p.standardError = errPipe
-            p.standardOutput = Pipe()
+            p.standardOutput = FileHandle.nullDevice
             var err: ServiceError?
             do {
                 try p.run()
+                // Drain before waiting: a full pipe would block the child forever.
+                let data = errPipe.fileHandleForReading.readDataToEndOfFile()
                 p.waitUntilExit()
-                let text = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let text = String(data: data, encoding: .utf8) ?? ""
                 if p.terminationStatus != 0 { err = Self.parseServiceError(text) }
             } catch {
                 err = ServiceError(code: "launch_failed", message: error.localizedDescription)
@@ -212,6 +270,18 @@ final class Store {
                 if let err { self.serviceError = err }
             }
         }
+    }
+
+    /// Whether launchd has the background service loaded for this user.
+    nonisolated static func daemonLoaded() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["print", "gui/\(getuid())/dev.loadside.daemon"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
     }
 
     nonisolated static func parseServiceError(_ text: String) -> ServiceError {
@@ -262,6 +332,7 @@ final class Store {
                 if account?.isFree == true { Task { await loadAppIds() } }
             }
             if j.status == .succeeded, j.kind == .export { finishExport(j) }
+            if !j.isActive { jobEnded(j) }
         case "devices":
             if let d = try? ev["devices"]?.decode([DeviceInfo].self) {
                 devices = d
@@ -270,13 +341,23 @@ final class Store {
         case "apps":
             if let a = try? ev["apps"]?.decode([AppRecord].self) { apps = a }
         case "account":
+            let before = (account?.email, account?.teamId)
             account = try? ev["account"]?.decode(AccountInfo.self)
             loggedIn = ev["loggedIn"]?.bool ?? ev["logged_in"]?.bool ?? false
-            if !loggedIn && account == nil { appIds = nil; certs = nil; teams = nil }
+            // Another Apple ID or team: its App IDs, certificates and teams differ.
+            if (!loggedIn && account == nil) || before != (account?.email, account?.teamId) {
+                appIds = nil; certs = nil; teams = nil
+                if account?.isFree == true { Task { await loadAppIds() } }
+            }
             Task { await loadSetup() }
         case "prompt":
             if let p = try? ev["prompt"]?.decode(Prompt.self), !prompts.contains(where: { $0.id == p.id }) {
                 prompts.append(p)
+                // Prompts are shown by the main window. If it's closed (menu
+                // bar only, or the user started this from Settings), open it.
+                // Only user-started work prompts (the daemon never prompts for
+                // background jobs), so bring the window forward right away.
+                bringMainWindowForward()
                 NSApp.requestUserAttention(.criticalRequest)
             }
         case "promptClosed", "prompt_closed":
@@ -287,6 +368,10 @@ final class Store {
                 logs.append(l)
                 if logs.count > 1500 { logs.removeFirst(logs.count - 1500) }
             }
+        case "schedule":
+            nextCheckAt = ev["next_check_at"]?.int ?? ev["nextCheckAt"]?.int
+        case "config":
+            if let c = try? ev["config"]?.decode(DaemonConfig.self) { config = c }
         case "notice":
             banner = Banner(title: ev["title"]?.string ?? "", message: ev["message"]?.string ?? "", isError: ev["level"]?.string == "error")
         default: break
@@ -336,14 +421,19 @@ final class Store {
     /// Free accounts can keep 3 sideloaded apps per device.
     static let freeSlotsPerDevice = 3
 
-    /// Apps Loadside tracks on the device with the most of them.
+    /// Sideloaded apps Loadside has on a device: still on it and not
+    /// expired (an expired app no longer counts toward the limit).
+    func activeApps(on udid: String) -> [AppRecord] {
+        let now = Int(Date().timeIntervalSince1970)
+        return apps.filter { $0.deviceUdid == udid && $0.onDevice != false && ($0.expiresAt ?? .max) > now }
+    }
+
+    /// Slots used on the connected device (else the device with the most apps).
     var slotsUsed: (device: String, used: Int)? {
-        let live = apps.filter { $0.onDevice != false }
-        let byDevice = Dictionary(grouping: live, by: \.deviceName)
-        guard let top = byDevice.max(by: { $0.value.count < $1.value.count }) else {
-            return devices.first.map { ($0.name, 0) }
-        }
-        return (top.key, top.value.count)
+        if let d = devices.first { return (d.name, activeApps(on: d.udid).count) }
+        let udids = Set(apps.map(\.deviceUdid))
+        guard let top = udids.max(by: { activeApps(on: $0).count < activeApps(on: $1).count }) else { return nil }
+        return (apps.first { $0.deviceUdid == top }?.deviceName ?? "", activeApps(on: top).count)
     }
 
     func loadAppIds() async { appIds = await run { try await client.call("app_ids", as: AppIdList.self) } ?? appIds }
