@@ -50,7 +50,9 @@ fn password_saved(email: &str) -> bool {
             return v;
         }
     }
-    let v = secrets::has_password(email);
+    // A Keychain lookup can wait on the system: let the runtime move other
+    // tasks off this thread meanwhile.
+    let v = tokio::task::block_in_place(|| secrets::has_password(email));
     *PASSWORD_SAVED.lock().unwrap() = Some((email.to_string(), v));
     v
 }
@@ -105,16 +107,24 @@ impl Engine {
 
     pub async fn reveal_developer_mode(self: &Arc<Self>, udid: &str) -> Result<Value, Failure> {
         self.require_usb(udid)?;
-        let p = device::provider_for(udid).await.map_err(|e| errors::explain(&e))?;
-        device::reveal_developer_mode(&p).await.map_err(|e| errors::explain(&e))?;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let p = device::provider_for(udid).await.map_err(|e| errors::explain(&e))?;
+            device::reveal_developer_mode(&p).await.map_err(|e| errors::explain(&e))
+        })
+        .await
+        .map_err(|_| f("timeout", "The device didn't answer in time.").with_hint("Unlock it, keep the cable connected, and try again."))??;
         Ok(Value::Null)
     }
 
     /// Turn on "Show this iPhone when on Wi-Fi" (same as Finder's checkbox).
     pub async fn enable_wifi_sync(self: &Arc<Self>, udid: &str) -> Result<Value, Failure> {
         let d = self.require_usb(udid)?;
-        let p = device::provider_for(udid).await.map_err(|e| errors::explain(&e))?;
-        device::enable_wifi_sync(&p).await.map_err(|e| errors::explain(&e))?;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let p = device::provider_for(udid).await.map_err(|e| errors::explain(&e))?;
+            device::enable_wifi_sync(&p).await.map_err(|e| errors::explain(&e))
+        })
+        .await
+        .map_err(|_| f("timeout", "The device didn't answer in time.").with_hint("Unlock it, keep the cable connected, and try again."))??;
         info!("Wi-Fi sync turned on for {}", d.name);
         self.set_devices(|devs| match devs.get_mut(udid) {
             Some(d) => {

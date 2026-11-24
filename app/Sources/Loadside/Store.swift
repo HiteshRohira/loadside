@@ -53,6 +53,12 @@ final class Store {
     private var triedInstallingAgent = false
 
     init() {
+        clockTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(300))
+                self?.clock = Date()
+            }
+        }
         client.onEvent = { [weak self] ev in Task { @MainActor in self?.apply(event: ev) } }
         client.onDisconnect = { [weak self] in Task { @MainActor in self?.disconnected() } }
         start()
@@ -152,6 +158,11 @@ final class Store {
         if !used { Self.unstage(path) }
     }
 
+    /// Advances every 5 minutes, for views whose state depends on the time
+    /// (the menu bar icon's "expires soon" dot).
+    var clock = Date()
+    @ObservationIgnored private var clockTask: Task<Void, Never>?
+
     /// Staged files of install sheets that are still open (they may retry).
     var liveStaging: Set<String> = []
     /// job id → staged inputs to drop once the job is over.
@@ -163,6 +174,11 @@ final class Store {
     func unstageWhenDone(job id: String, paths: [String]) {
         stagedForJob[id] = paths
         if let j = job(id), !j.isActive { jobEnded(j) }
+    }
+
+    /// The install sheet took its staged files back (closed, or retrying).
+    func forgetStaged(job id: String?) {
+        if let id { stagedForJob[id] = nil }
     }
 
     private func jobEnded(_ j: JobInfo) {
@@ -244,7 +260,10 @@ final class Store {
             // Already registered with launchd (e.g. still starting up at
             // login)? Then wait for it instead of reinstalling, which would
             // restart it.
-            if !force, Self.daemonLoaded() {
+            if !force, Self.daemonLoaded(), Self.agentProgram() == daemon.path {
+                // Registered for this copy of Loadside, maybe stopped: start it
+                // rather than reinstall (which would restart a running one).
+                Self.kickstartDaemon()
                 await MainActor.run { self.bootstrapping = false; self.triedInstallingAgent = false }
                 return
             }
@@ -270,6 +289,23 @@ final class Store {
                 if let err { self.serviceError = err }
             }
         }
+    }
+
+    /// The daemon binary the LaunchAgent runs, if it's installed.
+    nonisolated static func agentProgram() -> String? {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/dev.loadside.daemon.plist")
+        guard let d = NSDictionary(contentsOf: url), let args = d["ProgramArguments"] as? [String] else { return nil }
+        return args.first
+    }
+
+    nonisolated static func kickstartDaemon() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["kickstart", "gui/\(getuid())/dev.loadside.daemon"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return }
+        p.waitUntilExit()
     }
 
     /// Whether launchd has the background service loaded for this user.
@@ -307,12 +343,22 @@ final class Store {
     private func apply(snapshot s: Snapshot) {
         version = s.version
         pid = s.pid
+        let before = (account?.email, account?.teamId)
         account = s.account
         loggedIn = s.loggedIn
+        // Reconnected to a daemon on another Apple ID or team: drop its caches.
+        if before != (account?.email, account?.teamId) { appIds = nil; certs = nil; teams = nil }
         devices = s.devices
         apps = s.apps
         jobs = s.jobs
+        // Jobs that finished while we were disconnected.
+        for j in jobs where !j.isActive {
+            if j.status == .succeeded, j.kind == .export { finishExport(j) }
+            jobEnded(j)
+        }
+        let hadPrompts = !prompts.isEmpty
         prompts = s.prompts
+        if !prompts.isEmpty && !hadPrompts { bringMainWindowForward() }
         // Screenshot/QA aid: show a prompt sheet without a real sign-in.
         if let kind = ProcessInfo.processInfo.environment["LOADSIDE_DEMO_PROMPT"] {
             prompts.append(Prompt(id: "demo", kind: kind, payload: .object([:]), createdAt: 0))

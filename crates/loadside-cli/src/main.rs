@@ -115,6 +115,9 @@ enum Cmd {
         app_id: Option<String>,
         #[arg(long)]
         all: bool,
+        /// Put back an app that was deleted from the device
+        #[arg(long, conflicts_with = "all")]
+        reinstall: bool,
         #[arg(long)]
         detach: bool,
     },
@@ -425,9 +428,11 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Inspect { path } => {
             let staged = stage(&path)?;
             let v = call(&c, "inspect", json!({ "path": staged })).await;
-            // Only ever delete the per-call folder we created inside Incoming.
+            // Only ever delete the per-call folder we created inside Incoming
+            // (stage() hands back paths already inside Loadside's folder as is).
+            let created = abs(&path).map(PathBuf::from).ok() != Some(PathBuf::from(&staged));
             let staged = Path::new(&staged);
-            if let Some(dir) = staged.parent().filter(|d| d.parent() == Some(paths::incoming_dir().as_path())) {
+            if let Some(dir) = staged.parent().filter(|d| created && d.parent() == Some(paths::incoming_dir().as_path())) {
                 let _ = std::fs::remove_dir_all(dir);
             }
             let v = v?;
@@ -451,10 +456,24 @@ async fn run(cli: Cli) -> Result<()> {
             path, device, bundle_id, name, extensions, keep_watch, keep_device_restrictions, file_sharing,
             increased_memory_limit, inject, export, no_install, no_auto_refresh, allow_encrypted, allow_signing_key, detach,
         } => {
+            if no_install && export.is_none() {
+                bail!("--no-install needs --export <OUT.ipa> (otherwise the signed app would be thrown away)");
+            }
             if keep_watch {
                 eprintln!("note: --keep-watch has no effect; Apple Watch apps can't be signed and are always removed");
             }
-            let inject = inject.iter().map(|p| stage(p).map(PathBuf::from)).collect::<Result<Vec<_>>>()?;
+            // Remember which copies this command made, so only those are cleaned up.
+            let mut made: Vec<PathBuf> = Vec::new();
+            let inject = inject
+                .iter()
+                .map(|p| {
+                    let s = PathBuf::from(stage(p)?);
+                    if abs(p).map(PathBuf::from).ok() != Some(s.clone()) {
+                        made.push(s.clone());
+                    }
+                    Ok(s)
+                })
+                .collect::<Result<Vec<_>>>()?;
             let options = InstallOptions {
                 bundle_id,
                 display_name: name,
@@ -477,8 +496,10 @@ async fn run(cli: Cli) -> Result<()> {
                 subscribe(&c).await?;
             }
             let staged_path = stage(&path)?;
-            let mut staged: Vec<PathBuf> = options.inject.clone();
-            staged.push(PathBuf::from(&staged_path));
+            let mut staged = made;
+            if abs(&path).map(PathBuf::from).ok() != Some(PathBuf::from(&staged_path)) {
+                staged.push(PathBuf::from(&staged_path));
+            }
             let v = call(&c, "install", json!({
                 "path": staged_path, "device_udid": device, "options": options,
                 "export_path": export, "install": !no_install,
@@ -522,7 +543,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Refresh { app_id, all, detach } => {
+        Cmd::Refresh { app_id, all, reinstall, detach } => {
             if !detach {
                 subscribe(&c).await?;
             }
@@ -530,17 +551,17 @@ async fn run(cli: Cli) -> Result<()> {
                 serde_json::from_value(call(&c, "refresh_all", json!({})).await?["job_ids"].clone())?
             } else {
                 let id = app_id.context("give an app id (see `loadside apps`) or --all")?;
-                vec![call(&c, "refresh", json!({ "app_id": id })).await?["job_id"].as_str().unwrap_or("").to_string()]
+                vec![call(&c, "refresh", json!({ "app_id": id, "reinstall": reinstall })).await?["job_id"].as_str().unwrap_or("").to_string()]
             };
             if jobs.is_empty() {
                 println!("Nothing to refresh (are the devices connected?).");
             }
-            for j in jobs {
-                if detach {
+            if detach {
+                for j in &jobs {
                     println!("Queued job {j}");
-                } else {
-                    follow_job(&c, &j).await?;
                 }
+            } else if !jobs.is_empty() {
+                follow_jobs(&c, &jobs).await?;
             }
         }
         Cmd::Remove { app_id, uninstall } => {
@@ -699,22 +720,49 @@ async fn answer_prompt(c: &Client, p: &Prompt) -> Result<()> {
 }
 
 async fn follow_job(c: &Client, job_id: &str) -> Result<()> {
+    follow_jobs(c, &[job_id.to_string()]).await
+}
+
+/// Follow several jobs on the one event stream the client has, reporting
+/// each as it finishes; fails if any of them failed.
+async fn follow_jobs(c: &Client, job_ids: &[String]) -> Result<()> {
     let mut rx = c.take_events().await.context("no event stream")?;
+    let mut pending: std::collections::HashSet<&str> = job_ids.iter().map(String::as_str).collect();
     let mut last_len = 0;
-    loop {
+    let mut current: Option<String> = None;
+    let mut failures = Vec::new();
+    while !pending.is_empty() {
         let Some(ev) = rx.recv().await else { bail!("lost connection to loadsided") };
         match ev {
             Event::Prompt { prompt } => {
                 eprintln!();
                 answer_prompt(c, &prompt).await?;
             }
-            Event::Job { job } if job.id == job_id => {
+            Event::Job { job } if pending.contains(job.id.as_str()) => {
+                // Another job's progress starts on a fresh line.
+                if current.as_deref() != Some(job.id.as_str()) {
+                    if current.is_some() && last_len > 0 {
+                        eprintln!();
+                    }
+                    current = Some(job.id.clone());
+                    last_len = 0;
+                }
                 if render_job(&job, &mut last_len) {
-                    return finish_job(&job);
+                    pending.remove(job.id.as_str());
+                    current = None;
+                    last_len = 0;
+                    if let Err(e) = finish_job(&job) {
+                        failures.push(format!("{e:#}"));
+                    }
                 }
             }
             _ => {}
         }
+    }
+    match failures.len() {
+        0 => Ok(()),
+        1 => bail!("{}", failures[0]),
+        n => bail!("{n} jobs failed:\n{}", failures.join("\n")),
     }
 }
 
@@ -971,7 +1019,11 @@ async fn daemon_cmd(cmd: &DaemonCmd) -> Result<()> {
             // The app's menu bar login item would otherwise start Loadside at
             // the next login, which would reinstall the service.
             let menubar = plist.with_file_name("dev.loadside.menubar.plist");
-            let _ = std::fs::remove_file(&menubar);
+            match std::fs::remove_file(&menubar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => bail!("couldn't remove {} (it would start Loadside at login): {e}", menubar.display()),
+            }
             println!("✓ Background service removed (app, settings and apps list are kept)");
         }
         DaemonCmd::Start => {

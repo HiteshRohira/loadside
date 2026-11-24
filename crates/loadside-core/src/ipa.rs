@@ -205,14 +205,28 @@ fn read_plist_untrusted(p: &Path) -> Result<plist::Dictionary> {
 }
 
 fn inspect_app_dir(app: &Path) -> Result<IpaInfo> {
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    if !real_dir(app) {
+        return Err(bad_bundle("The app is a link, not a folder."));
+    }
     let main = read_plist_untrusted(&app.join("Info.plist")).context("not a valid app bundle")?;
     let mut subs = Vec::new();
+    let mut plist_bytes: u64 = 0;
     for (dir, kind, ext) in [("PlugIns", "extension", "appex"), ("Watch", "watch", "app")] {
+        // Never follow a linked folder out of the bundle.
+        if !real_dir(&app.join(dir)) {
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(app.join(dir)) else { continue };
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == ext) {
-                if let Ok(d) = read_plist_untrusted(&p.join("Info.plist")) {
+            if p.extension().is_some_and(|x| x == ext) && e.file_type().is_ok_and(|t| t.is_dir()) {
+                let plist = p.join("Info.plist");
+                plist_bytes += std::fs::symlink_metadata(&plist).map(|m| m.len()).unwrap_or(0);
+                if plist_bytes > 4 * MAX_PLIST_BYTES {
+                    bail!("not a valid app: too many or too large Info.plist files");
+                }
+                if let Ok(d) = read_plist_untrusted(&plist) {
                     subs.push((kind.to_string(), d));
                 }
             }
@@ -279,6 +293,11 @@ pub fn verify_tree(root: &Path) -> Result<()> {
                 if !resolved.starts_with(&canon_root) {
                     return Err(bad_bundle(format!("{} links outside the app.", rel(root, &p))));
                 }
+                // iOS bundles don't need folder links, and a loop (a link to a
+                // parent) sends tools that walk the tree around forever.
+                if resolved.is_dir() {
+                    return Err(bad_bundle(format!("{} is a link to a folder.", rel(root, &p))));
+                }
             } else if t.is_dir() {
                 stack.push(p);
             } else if t.is_fifo() || t.is_socket() || t.is_block_device() || t.is_char_device() {
@@ -336,6 +355,14 @@ fn copy_dir_inner(src: &Path, dst: &Path, links: &mut Vec<(PathBuf, PathBuf)>) -
             copy_dir_inner(&from, &to, links)?;
         } else if t.is_file() {
             std::fs::copy(&from, &to)?;
+            // Signing rewrites plists and binaries: keep them writable.
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(m) = std::fs::metadata(&to) {
+                let mode = m.permissions().mode();
+                if mode & 0o600 != 0o600 {
+                    let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode((mode & 0o755) | 0o600));
+                }
+            }
         } else {
             return Err(bad_bundle(format!("{} is a special file.", from.display())));
         }
@@ -594,6 +621,9 @@ pub fn prepare(src: &Path, work: &Path, opts: &InstallOptions) -> Result<Prepare
 
     // Nothing above may have introduced an escaping link.
     verify_tree(&app_dir)?;
+    // The signer rewrites every bundle's executable in place: each must be a
+    // plain file name naming a regular file inside its own bundle.
+    verify_executables(&app_dir)?;
 
     // isideload embeds the signing certificate + private key into some apps.
     let final_id = new_id.clone();
@@ -605,6 +635,37 @@ pub fn prepare(src: &Path, work: &Path, opts: &InstallOptions) -> Result<Prepare
 
     let info = inspect_app_dir(&app_dir)?;
     Ok(Prepared { app_dir, info, warnings })
+}
+
+/// Every bundle under `root` (the app, extensions, frameworks, anything
+/// with an Info.plist) must name its executable with a plain file name, and
+/// that must be a regular file (not a link) if it exists.
+fn verify_executables(root: &Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let plist = dir.join("Info.plist");
+        if std::fs::symlink_metadata(&plist).is_ok_and(|m| m.is_file()) {
+            if let Ok(d) = read_plist_untrusted(&plist) {
+                if let Some(exe) = plist_str(&d, "CFBundleExecutable") {
+                    if !valid_file_name(&exe) {
+                        return Err(bad_bundle(format!("{} names its executable \"{exe}\", which isn't a plain file name.", rel(root, &dir))));
+                    }
+                    match std::fs::symlink_metadata(dir.join(&exe)) {
+                        Ok(m) if !m.is_file() => {
+                            return Err(bad_bundle(format!("{} isn't a regular file.", rel(root, &dir.join(&exe)))));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(e.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn remove_any(p: &Path) -> Result<()> {

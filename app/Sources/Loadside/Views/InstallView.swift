@@ -42,7 +42,9 @@ struct InstallSheet: View {
         .frame(width: 520)
         .presentsPrompts()
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted, perform: handleDrop)
-        .task { await load() }
+        // Retries once the background service connects (opening an IPA can
+        // launch Loadside before it's up).
+        .task(id: store.connection == .connected) { if inspect == nil { await load() } }
         .onAppear { if deviceUdid.isEmpty { deviceUdid = store.devices.first?.udid ?? "" } }
         .onChange(of: store.devices) { old, devs in
             if let lost = lostDevice, devs.contains(where: { $0.udid == lost.udid }) {
@@ -195,7 +197,10 @@ struct InstallSheet: View {
     /// (Updating an app that's already there doesn't take a new slot.)
     private var slotsFull: Bool {
         guard store.account?.isFree == true, !deviceUdid.isEmpty, let i = inspect?.info else { return false }
-        let others = store.activeApps(on: deviceUdid).filter { $0.originalBundleId != i.bundleId }
+        // An update keeps its final bundle ID (custom ID or the app's, plus the team).
+        let custom = options.bundleId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let finalId = "\(custom.isEmpty ? i.bundleId : custom).\(store.account?.teamId ?? "")"
+        let others = store.activeApps(on: deviceUdid).filter { $0.bundleId != finalId }
         return others.count >= Store.freeSlotsPerDevice
     }
 
@@ -464,16 +469,23 @@ struct InstallSheet: View {
 
     private func load() async {
         do {
-            // Opening an IPA can launch Loadside: give the background service
-            // a moment to connect before asking it anything.
-            for _ in 0..<75 where store.connection != .connected {
-                try await Task.sleep(for: .milliseconds(200))
+            // Opening an IPA can launch Loadside before the background
+            // service is up; this runs again once it connects.
+            guard store.connection == .connected else { return }
+            inspectError = nil
+            // Hand the daemon a copy inside Loadside's own folder (once).
+            let path: String
+            if let staged { path = staged } else {
+                path = try await Store.stage(source).path
+                // Closed while copying: drop the copy instead of leaking it.
+                if Task.isCancelled {
+                    Store.unstage(path)
+                    return
+                }
+                staged = path
+                store.liveStaging.insert(path)
             }
-            // Hand the daemon a copy inside Loadside's own folder.
-            let s = try await Store.stage(source)
-            staged = s.path
-            store.liveStaging.insert(s.path)
-            inspect = try await store.inspect(path: s.path, options: options)
+            inspect = try await store.inspect(path: path, options: options)
             // Always fresh: App IDs expire, and another tool may have added some.
             if store.account?.isFree == true { await store.loadAppIds() }
         } catch {
@@ -487,6 +499,7 @@ struct InstallSheet: View {
     private func cleanUp() {
         if let staged { store.liveStaging.remove(staged) }
         if busy || (job?.isActive ?? false) { return }
+        store.forgetStaged(job: jobId)
         for p in [staged].compactMap({ $0 }) + options.inject { store.unstageIfUnused(p) }
     }
 
@@ -543,12 +556,15 @@ struct InstallSheet: View {
     }
 
     private func install() async {
-        guard let staged else { return }
+        // An empty target would let the daemon pick a device on its own.
+        guard let staged, !deviceUdid.isEmpty else { return }
+        let target = deviceUdid
+        store.forgetStaged(job: jobId)
         busy = true
         defer { busy = false }
         let inputs = stagedInputs
         jobId = await store.run {
-            try await store.install(InstallParams(path: staged, deviceUdid: deviceUdid, options: options, exportPath: nil, install: true))
+            try await store.install(InstallParams(path: staged, deviceUdid: target, options: options, exportPath: nil, install: true))
         }
         if let jobId { store.unstageWhenDone(job: jobId, paths: inputs) }
     }
@@ -564,6 +580,7 @@ struct InstallSheet: View {
         // The daemon writes into Loadside's folder; the app moves it to `out`.
         guard let staging = try? Store.exportStaging(name: out.lastPathComponent) else { return }
         let inputs = stagedInputs
+        store.forgetStaged(job: jobId)
         jobId = await store.run {
             try await store.install(InstallParams(path: staged, deviceUdid: deviceUdid.isEmpty ? nil : deviceUdid, options: options, exportPath: staging.path, install: false))
         }

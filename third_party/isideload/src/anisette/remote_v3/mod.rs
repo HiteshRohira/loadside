@@ -86,10 +86,13 @@ impl RemoteV3AnisetteProvider {
                 .connect_timeout(std::time::Duration::from_secs(20))
                 .timeout(std::time::Duration::from_secs(60))
                 // Never follow a redirect to plain http on another host.
+                // Redirects only within the same server and scheme (no
+                // downgrade, no hop to another host).
                 .redirect(reqwest::redirect::Policy::custom(|a| {
-                    let u = a.url();
-                    let local = matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]" | "::1"));
-                    if a.previous().len() >= 5 || (u.scheme() != "https" && !local) { a.stop() } else { a.follow() }
+                    let same = a.previous().first().is_some_and(|first| {
+                        first.scheme() == a.url().scheme() && first.host_str() == a.url().host_str() && first.port_or_known_default() == a.url().port_or_known_default()
+                    });
+                    if a.previous().len() >= 5 || !same { a.stop() } else { a.follow() }
                 }))
                 .build()?;
             #[cfg(feature = "wasm")]

@@ -11,6 +11,7 @@ struct PendingInstall: Identifiable {
 struct ContentView: View {
     @Environment(Store.self) private var store
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
     @State private var pending: PendingInstall?
     @State private var showSetup = false
     @State private var detailAppId: String?
@@ -65,7 +66,10 @@ struct ContentView: View {
                 .overlay(alignment: .top) { BannerView() }
         }
         .onChange(of: store.navigate) { _, target in handle(target) }
-        .onAppear { handle(store.navigate) }
+        .onAppear {
+            handle(store.navigate)
+            AppDelegate.openMainWindow = { openWindow(id: "main") }
+        }
         // Double-clicked IPA / "Open With Loadside" (into this window, not a new one).
         .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
         .onOpenURL { url in

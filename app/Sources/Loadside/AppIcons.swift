@@ -142,17 +142,19 @@ final class AppIcons {
     }
 
     private nonisolated static func bestIcon(inAppDir app: URL) -> Data? {
-        guard let items = try? FileManager.default.contentsOfDirectory(atPath: app.path) else { return nil }
+        // The bundle itself must be a real folder, not a link to one.
+        guard let root = try? FileManager.default.attributesOfItem(atPath: app.path),
+              root[.type] as? FileAttributeType == .typeDirectory,
+              let items = try? FileManager.default.contentsOfDirectory(atPath: app.path) else { return nil }
         let best = items.map { ($0, score($0)) }.filter { $0.1 >= 0 }.max { $0.1 < $1.1 }?.0
         guard let best else { return nil }
-        let file = app.appendingPathComponent(best)
-        // No links, FIFOs or devices, and nothing huge.
-        guard let a = try? FileManager.default.attributesOfItem(atPath: file.path),
-              a[.type] as? FileAttributeType == .typeRegular,
-              let size = (a[.size] as? NSNumber)?.intValue, size <= maxIconBytes,
-              let fh = try? FileHandle(forReadingFrom: file)
-        else { return nil }
-        defer { try? fh.close() }
+        // Open without following links, then check what was actually opened
+        // (no check-then-open race): a regular file, not too big.
+        let fd = open(app.appendingPathComponent(best).path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { return nil }
+        let fh = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= maxIconBytes else { return nil }
         return try? fh.read(upToCount: maxIconBytes)
     }
 

@@ -232,7 +232,9 @@ fn find_dylibs(dir: &Path, bundle_root: &Path) -> Result<Vec<String>, Report> {
             ))?;
 
             let path = entry.path();
-            let file_type = isideload_vfs::fs::metadata(&path)
+            // Loadside patch: don't follow links (a link back to a parent
+            // folder made this recurse forever).
+            let file_type = isideload_vfs::fs::symlink_metadata(&path)
                 .map(|m| m.file_type())
                 .context(SideloadError::InvalidBundle(
                     "Failed to get file type".to_string(),

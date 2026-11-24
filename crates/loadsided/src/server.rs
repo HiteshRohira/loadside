@@ -167,7 +167,12 @@ async fn connection(engine: Arc<Engine>, stream: UnixStream) {
         f.abort();
     }
     drop(tx);
-    let _ = writer.await;
+    // A client that stopped reading can leave the writer stuck in write_all;
+    // don't keep the connection (and its interactive flag) alive for it.
+    let abort = writer.abort_handle();
+    if tokio::time::timeout(std::time::Duration::from_secs(2), writer).await.is_err() {
+        abort.abort();
+    }
 }
 
 fn encode(m: &ServerMessage) -> String {
@@ -211,6 +216,10 @@ async fn dispatch(engine: &Arc<Engine>, method: &str, p: Value) -> Result<Value,
             let params: InstallParams = serde_json::from_value(p).map_err(|e| Failure::new("bad_request", e.to_string()))?;
             if params.path.is_empty() {
                 return Err(Failure::new("bad_request", "missing parameter: path"));
+            }
+            // Sign-only without somewhere to save it would spend App IDs for nothing.
+            if params.install == Some(false) && params.export_path.as_deref().is_none_or(str::is_empty) {
+                return Err(Failure::new("bad_request", "Signing without installing needs an export path."));
             }
             let id = engine.enqueue(JobSpec::Install(params), false)?;
             Ok(json!({ "job_id": id }))

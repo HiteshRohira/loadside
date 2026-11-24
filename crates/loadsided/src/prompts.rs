@@ -73,10 +73,18 @@ impl Prompter {
             pending.insert(id.clone(), (prompt.clone(), tx));
         }
         let _ = self.events.send(Event::Prompt { prompt });
-        let r = tokio::time::timeout(timeout, rx).await;
-        if self.pending.lock().unwrap().remove(&id).is_some() {
-            let _ = self.events.send(Event::PromptClosed { id });
+        // Also runs if this future is dropped (an outer timeout cancelled
+        // the sign-in): never leave a prompt nobody is waiting for.
+        struct Cleanup<'a>(&'a Prompter, String);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                if self.0.pending.lock().unwrap().remove(&self.1).is_some() {
+                    let _ = self.0.events.send(Event::PromptClosed { id: self.1.clone() });
+                }
+            }
         }
+        let _cleanup = Cleanup(self, id.clone());
+        let r = tokio::time::timeout(timeout, rx).await;
         match r {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(_)) => Err(Failure::new("prompt_cancelled", "The request for input was closed before it was answered.")),

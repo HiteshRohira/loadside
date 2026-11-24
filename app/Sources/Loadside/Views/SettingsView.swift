@@ -4,6 +4,7 @@ import SwiftUI
 struct SettingsView: View {
     static let tabKey = "settingsTab"
     @Environment(Store.self) private var store
+    @Environment(\.openWindow) private var openWindow
     @AppStorage(SettingsView.tabKey) private var tab = "general"
 
     var body: some View {
@@ -18,6 +19,9 @@ struct SettingsView: View {
                 .tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }.tag("advanced")
         }
         .frame(width: 580, height: 520)
+        // With the menu bar icon off this may be the only window left; it
+        // must still be able to reopen the main one (prompts, Setup Guide).
+        .task { AppDelegate.openMainWindow = { openWindow(id: "main") } }
         .overlay {
             if store.connection != .connected {
                 ContentUnavailableView("Background service not running", systemImage: "bolt.horizontal.circle",
@@ -57,7 +61,9 @@ struct GeneralSettings: View {
                     .disabled(!c.autoRefresh)
                     LabeledContent("Next check") {
                         HStack {
-                            Text(store.nextCheckAt.map { Fmt.rel($0) } ?? "—").foregroundStyle(.secondary)
+                            TimelineView(.periodic(from: .now, by: 30)) { _ in
+                                Text(store.nextCheckAt.map { Fmt.rel($0) } ?? "—").foregroundStyle(.secondary)
+                            }
                             Button(checking ? "Checking…" : "Check Now") {
                                 Task { checking = true; await store.checkNow(); try? await Task.sleep(for: .seconds(1)); checking = false }
                             }
@@ -147,7 +153,6 @@ struct AdvancedSettings: View {
         Form {
             if let c = store.config {
                 Section {
-                    Toggle("Keep a copy of each installed IPA", isOn: configBinding(store, \.keepLibraryCopy, "keep_library_copy"))
                     Toggle("Revoke old Loadside certificates automatically", isOn: configBinding(store, \.autoRevokeOwnCerts, "auto_revoke_own_certs"))
                     HStack {
                         TextField("Certificate name", text: $machineName).onSubmit(saveMachineName)
@@ -158,7 +163,7 @@ struct AdvancedSettings: View {
                 } header: {
                     Text("Signing")
                 } footer: {
-                    Footnote("The IPA copy lets refreshes work after you delete the download. Changing the certificate name creates a new certificate.")
+                    Footnote("Loadside keeps its own copy of each installed IPA, so refreshes work after you delete the download. Changing the certificate name creates a new certificate.")
                 }
                 Section {
                     HStack {
@@ -235,6 +240,8 @@ struct AdvancedSettings: View {
 @MainActor func bringMainWindowForward() {
     AppDelegate.startHidden = false
     NSApp.setActivationPolicy(.regular)
+    // Hidden (⌘H) windows report not visible; unhide rather than open a second one.
+    if NSApp.isHidden { NSApp.unhide(nil) }
     if let w = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("main") == true && ($0.isVisible || $0.isMiniaturized) }) {
         if w.isMiniaturized { w.deminiaturize(nil) }
         w.makeKeyAndOrderFront(nil)

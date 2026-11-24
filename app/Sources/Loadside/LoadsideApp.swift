@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Started by the login item: menu bar icon only, no window or Dock tile.
     /// Cleared once the first window has been dismissed.
     @MainActor static var startHidden = CommandLine.arguments.contains(LoginItem.launchArgument) && Prefs.menuBarOn
+    @MainActor static let launchedAt = Date()
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         if Self.startHidden { NSApp.setActivationPolicy(.accessory) }
@@ -91,7 +92,9 @@ struct LoadsideApp: App {
                 .environment(store)
                 .frame(minWidth: 560, minHeight: 460)
                 .onAppear {
-                    if AppDelegate.startHidden {
+                    // Only the launch itself is hidden: a window that appears
+                    // later (an opened IPA, say) is one the user asked for.
+                    if AppDelegate.startHidden && Date().timeIntervalSince(AppDelegate.launchedAt) < 5 {
                         // SwiftUI opens the first window regardless; close it unseen.
                         AppDelegate.startHidden = false
                         DispatchQueue.main.async {

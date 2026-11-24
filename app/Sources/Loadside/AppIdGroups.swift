@@ -54,11 +54,11 @@ extension Store {
         let sorted = list.sorted { $0.identifier.count < $1.identifier.count }
         var groups: [AppIdGroup] = []
         for a in sorted {
-            if let gi = groups.lastIndex(where: { a.identifier.hasPrefix($0.main.identifier + ".") }) {
+            let tracked = apps.first { $0.bundleId == a.identifier }
+            if tracked == nil, let gi = groups.lastIndex(where: { a.identifier.hasPrefix($0.main.identifier + ".") }) {
                 groups[gi].extensions.append(a)
             } else {
-                let app = apps.first { $0.bundleId == a.identifier }
-                groups.append(AppIdGroup(main: a, extensions: [], tracked: app))
+                groups.append(AppIdGroup(main: a, extensions: [], tracked: tracked))
             }
         }
         return groups.sorted { ($0.main.expiresAt ?? .max) < ($1.main.expiresAt ?? .max) }

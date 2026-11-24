@@ -53,13 +53,19 @@ struct MenuBarView: View {
                             AppIconView(path: app.sourcePath, name: app.name, size: 22)
                             Text(app.name).lineLimit(1)
                             Spacer()
-                            ExpiryBadge(expiresAt: app.expiresAt)
-                            Button { Task { await store.refresh(app) } } label: {
-                                Image(systemName: "arrow.clockwise")
+                            if app.onDevice == false {
+                                // Deleted from the device: reinstalling is a
+                                // deliberate choice made in the app's details.
+                                Text("Deleted").font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                ExpiryBadge(expiresAt: app.expiresAt)
+                                Button { Task { await store.refresh(app) } } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                .buttonStyle(.borderless)
+                                .help(store.devices.contains { $0.udid == app.deviceUdid } ? "Refresh \(app.name)" : "Connect \(app.deviceName) first")
+                                .disabled(store.activeJobs.contains { $0.appId == app.id } || !store.devices.contains { $0.udid == app.deviceUdid })
                             }
-                            .buttonStyle(.borderless)
-                            .help("Refresh \(app.name)")
-                            .disabled(store.activeJobs.contains { $0.appId == app.id })
                         }
                     }
                     if store.apps.count > 6 {
@@ -189,6 +195,9 @@ struct MenuBarLabel: View {
     @Environment(Store.self) private var store
     @Environment(\.openWindow) private var openWindow
     var body: some View {
+        // The expiry check depends on the time: `store.clock` ticks for it.
+        // (A TimelineView in a menu bar label makes SwiftUI redraw it in a loop.)
+        let _ = store.clock
         let busy = !store.activeJobs.isEmpty
         let attention = store.connection != .connected || (store.setup?.checks.contains(where: \.isBlocking) ?? false)
             // Apps deleted from the device aren't refreshed on purpose: no alarm.

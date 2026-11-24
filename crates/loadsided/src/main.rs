@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
     let logs = logging::init(foreground);
     loadside_core::init();
 
-    // Two worker threads are plenty; signing parallelism comes from rayon.
+    // Four worker threads are plenty; signing parallelism comes from rayon.
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     rt.block_on(run(logs))
 }

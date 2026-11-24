@@ -55,6 +55,8 @@ pub struct Engine {
     pub events: broadcast::Sender<Event>,
     pub prompts: Prompter,
     jobs: Mutex<Vec<JobInfo>>,
+    /// Files queued or running install jobs will read (kept by the sweep).
+    job_inputs: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// Apps being removed: no new jobs for them until that's done.
     removing: Mutex<std::collections::HashSet<String>>,
     queue: mpsc::UnboundedSender<QueuedJob>,
@@ -108,6 +110,7 @@ impl Engine {
             events,
             jobs: Mutex::default(),
             removing: Mutex::default(),
+            job_inputs: Mutex::default(),
             queue,
             devices: Mutex::default(),
             mux: Mutex::default(),
@@ -369,10 +372,10 @@ impl Engine {
             Ok(s) => {
                 *guard = Some(s.clone());
                 self.logged_in.store(true, Ordering::SeqCst);
-                drop(guard);
                 self.needs_interactive_login.store(false, Ordering::SeqCst);
                 // Keep the saved account in step with what Apple reports now
-                // (name, team, free/paid).
+                // (name, team, free/paid). Done before releasing the session
+                // lock, so a sign-out waiting on it can't be undone by this.
                 let info = s.account_info();
                 let changed = {
                     let mut st = self.state.lock().unwrap();
@@ -380,6 +383,7 @@ impl Engine {
                     st.account = Some(info);
                     changed
                 };
+                drop(guard);
                 if changed {
                     self.save_state();
                 }
@@ -423,7 +427,7 @@ impl Engine {
     }
 
     pub async fn teams(self: &Arc<Self>) -> Result<Value, Failure> {
-        let s = self.session(false, true).await?;
+        let s = self.session(false, false).await?;
         Ok(json!({
             "selected": s.team.team_id,
             "teams": s.team_summaries(),
@@ -436,8 +440,8 @@ impl Engine {
         let s = guard.as_mut().ok_or_else(|| f("needs_login", "You're not signed in."))?;
         s.select_team(team_id).map_err(|e| errors::explain(&e))?;
         let info = s.account_info();
-        drop(guard);
         self.state.lock().unwrap().account = Some(info.clone());
+        drop(guard);
         self.save_state();
         self.emit_account(true);
         Ok(json!(info))
@@ -449,13 +453,15 @@ impl Engine {
         F: Fn(Session) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let s = self.session(false, true).await?;
+        // Reads like App IDs and certificates are fetched automatically by
+        // the app; they must never pop up a 2FA prompt on their own.
+        let s = self.session(false, false).await?;
         match op(s).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 let fl = errors::explain(&e);
                 if fl.code == "session_expired" {
-                    let s = self.session(true, true).await?;
+                    let s = self.session(true, false).await?;
                     op(s).await.map_err(|e| errors::explain(&e))
                 } else {
                     Err(fl)
@@ -581,6 +587,12 @@ impl Engine {
                 }
             }
         }
+        if let JobSpec::Install(p) = &spec {
+            let mut inputs: Vec<PathBuf> = p.options.inject.clone();
+            inputs.push(PathBuf::from(&p.path));
+            inputs.extend(p.export_path.as_ref().map(PathBuf::from));
+            self.job_inputs.lock().unwrap().insert(id.clone(), inputs);
+        }
         self.emit(Event::Job { job });
         self.queue
             .send(QueuedJob { id: id.clone(), spec, background })
@@ -622,7 +634,10 @@ impl Engine {
                     _ => None,
                 }
             };
-            let Some(claimed) = claimed else { continue };
+            let Some(claimed) = claimed else {
+                self.job_inputs.lock().unwrap().remove(&job.id);
+                continue;
+            };
             self.emit(Event::Job { job: claimed });
             // Run on its own task so a panic fails this job instead of
             // silently killing the queue.
@@ -639,6 +654,7 @@ impl Engine {
                 Err(f("internal", "Loadside hit an internal error while running this job.")
                     .with_hint("Please report it with the log (Activity → Logs). Other jobs keep running."))
             });
+            self.job_inputs.lock().unwrap().remove(&job.id);
             let now = loadside_core::now();
             match result {
                 Ok(()) => self.update_job(&job.id, |j| {
@@ -789,6 +805,9 @@ impl Engine {
                 keep.extend(a.options.inject.iter().cloned());
             }
         }
+        for inputs in self.job_inputs.lock().unwrap().values() {
+            keep.extend(inputs.iter().cloned());
+        }
         for dir in [paths::incoming_dir(), paths::exports_dir()] {
             let Ok(rd) = std::fs::read_dir(&dir) else { continue };
             for e in rd.flatten() {
@@ -887,6 +906,11 @@ impl Engine {
             let s2 = src.clone();
             let ipa_id = tokio::task::spawn_blocking(move || ipa::inspect(&s2).ok().map(|i| i.bundle_id)).await.ok().flatten();
             let st = self.state.lock().unwrap();
+            // What this install will be signed as: the custom bundle ID if one
+            // was given, plus the team suffix. Same final ID = an update.
+            let team = st.account.as_ref().and_then(|a| a.team_id.clone()).unwrap_or_default();
+            let base = p.options.bundle_id.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(str::to_string).or(ipa_id);
+            let final_id = base.map(|b| format!("{b}.{team}"));
             if st.account.as_ref().and_then(|a| a.is_free) == Some(true) {
                 let now = loadside_core::now();
                 let active = st
@@ -895,7 +919,7 @@ impl Engine {
                     .filter(|a| Some(&a.device_udid) == udid.as_ref())
                     .filter(|a| a.on_device != Some(false) && a.expires_at.is_none_or(|e| e > now))
                     // Updating an app that's already there doesn't take a slot.
-                    .filter(|a| ipa_id.as_deref() != Some(a.original_bundle_id.as_str()))
+                    .filter(|a| final_id.as_deref() != Some(a.bundle_id.as_str()))
                     .count();
                 if active >= 3 {
                     let w = "This device already has 3 active apps from Loadside; free accounts allow 3 at a time.".to_string();
@@ -1059,9 +1083,9 @@ impl Engine {
                         self.mutate_app(app_id, |a| a.on_device = Some(false));
                         self.emit_apps();
                         return Err(f("not_on_device", "The app was deleted from the device, so it wasn't refreshed.")
-                            .with_hint("Use Reinstall to put it back, or Remove to forget it."));
+                            .with_hint("Use Reinstall to put it back (or `loadside refresh --reinstall <id>`), or Remove to forget it."));
                     }
-                    None if background => {
+                    None => {
                         return Err(f("device_not_found", "Couldn't check the device, so the refresh was skipped.")
                             .with_hint(crate::checklist::NOT_CONNECTED_HINT));
                     }
@@ -1111,6 +1135,15 @@ impl Engine {
                 // Device-away / sign-in-needed aren't signing failures: they
                 // shouldn't push the next attempt out with backoff.
                 let transient = matches!(fl.code.as_str(), "not_on_device" | "device_not_found" | "needs_2fa" | "needs_login");
+                if transient && fl.code != "not_on_device" {
+                    // due_apps allows a retry after 5 minutes; make sure a
+                    // check actually happens then.
+                    let tx = self.check_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(305)).await;
+                        let _ = tx.send(());
+                    });
+                }
                 self.mutate_app(app_id, |a| {
                     a.last_error = Some(Failure { detail: None, ..fl.clone() });
                     if !transient {
@@ -1119,7 +1152,9 @@ impl Engine {
                 });
                 self.save_state();
                 self.emit_apps();
-                if background && !matches!(fl.code.as_str(), "not_on_device" | "device_not_found" | "needs_2fa") {
+                // Tell the user once per kind of problem, not on every retry.
+                let repeat = rec.last_error.as_ref().is_some_and(|e| e.code == fl.code);
+                if background && !repeat && !matches!(fl.code.as_str(), "not_on_device" | "device_not_found" | "needs_2fa") {
                     self.notify(&format!("Couldn't refresh {}", rec.name), &fl.hint.clone().unwrap_or(fl.message.clone()));
                 }
                 Err(fl)

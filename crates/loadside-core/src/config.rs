@@ -77,7 +77,9 @@ pub fn anisette_url_ok(url: &str) -> bool {
     // Parse rather than compare prefixes: "http://localhost:x@example.com"
     // looks local but sends to example.com.
     let Ok(u) = reqwest::Url::parse(url) else { return false };
-    if !u.username().is_empty() || u.password().is_some() {
+    // Endpoints are appended to this as text: a query or fragment would
+    // swallow them.
+    if !u.username().is_empty() || u.password().is_some() || u.query().is_some() || u.fragment().is_some() {
         return false;
     }
     match (u.scheme(), u.host()) {
@@ -106,6 +108,8 @@ mod anisette_url_tests {
         assert!(!anisette_url_ok("http://localhost.example.com"));
         assert!(!anisette_url_ok("ftp://localhost"));
         assert!(!anisette_url_ok("https://"));
+        assert!(!anisette_url_ok("https://ani.example.com/?x=1"));
+        assert!(!anisette_url_ok("https://ani.example.com/#x"));
     }
 }
 
