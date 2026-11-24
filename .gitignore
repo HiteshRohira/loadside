@@ -1,0 +1,8 @@
+/target
+/dist
+/app/.build
+.DS_Store
+# Raw captures and portfolio posters contain account details / local paths.
+/docs/media/
+/docs/posters/
+*.ipa

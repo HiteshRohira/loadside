@@ -1,0 +1,34 @@
+[package]
+name = "loadside-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures.workspace = true
+chrono.workspace = true
+isideload = { version = "0.5.2", default-features = false, features = ["install", "keyring-storage", "tokio-mt"] }
+idevice = { version = "0.1.68", default-features = false, features = ["ring", "usbmuxd", "afc", "installation_proxy", "amfi"] }
+rootcause = "0.12"
+plist = "1.8"
+zip = { version = "8.3", default-features = false, features = ["deflate"] }
+keyring = { version = "3.6.3", features = ["apple-native"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+tar = "0.4"
+ruzstd = "0.8"
+lzma-rs = "0.3"
+async-trait = "0.1"
+libc = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy"] }
+
+[dev-dependencies]
+tempfile = "3"

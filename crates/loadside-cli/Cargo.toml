@@ -1,0 +1,21 @@
+[package]
+name = "loadside-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "loadside"
+path = "src/main.rs"
+
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
+plist = "1.8"
+loadside-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
