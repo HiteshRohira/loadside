@@ -50,7 +50,7 @@ fn password_saved(email: &str) -> bool {
             return v;
         }
     }
-    let v = secrets::password(email).ok().flatten().is_some();
+    let v = secrets::has_password(email);
     *PASSWORD_SAVED.lock().unwrap() = Some((email.to_string(), v));
     v
 }

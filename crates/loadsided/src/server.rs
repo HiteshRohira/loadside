@@ -21,8 +21,14 @@ pub async fn serve(engine: Arc<Engine>, listener: UnixListener) {
                 let me = unsafe { libc::geteuid() };
                 match stream.peer_cred() {
                     Ok(c) if c.uid() == me => {}
-                    other => {
-                        warn!("Rejected IPC connection from another user ({other:?})");
+                    Ok(c) => {
+                        warn!("Rejected IPC connection from another user (uid {})", c.uid());
+                        continue;
+                    }
+                    // The client hung up before we looked (e.g. a readiness
+                    // probe). Nothing to serve, and nothing suspicious.
+                    Err(e) => {
+                        tracing::debug!("IPC client went away before the peer check: {e}");
                         continue;
                     }
                 }

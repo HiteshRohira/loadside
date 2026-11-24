@@ -22,6 +22,22 @@ pub fn password(email: &str) -> Result<Option<String>> {
     }
 }
 
+/// Whether a password is saved, without reading it. Reading the secret can
+/// raise a Keychain approval dialog (and blocks until it's answered); looking
+/// up only the item's attributes never does.
+pub fn has_password(email: &str) -> bool {
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+    ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(SERVICE)
+        .account(email)
+        .load_attributes(true)
+        .limit(Limit::Max(1))
+        .search()
+        .map(|r| !r.is_empty())
+        .unwrap_or(false)
+}
+
 pub fn delete_password(email: &str) -> Result<()> {
     match keyring::Entry::new(SERVICE, email)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),

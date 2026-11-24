@@ -5,21 +5,24 @@ struct DevicesView: View {
     @State private var refreshing = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if store.devices.isEmpty {
-                    ContentUnavailableView {
-                        Label("No devices", systemImage: "iphone.slash")
-                    } description: {
-                        Text("Connect an iPhone or iPad with a cable, unlock it and tap \"Trust\".\nWith Wi-Fi sync on, it also appears here when it's on the same Wi-Fi as this Mac.")
-                    }
-                    .padding(.top, 60)
+        Group {
+            if store.devices.isEmpty {
+                // Same placement as the other empty states (centred in the pane).
+                ContentUnavailableView {
+                    Label("No devices", systemImage: "iphone.slash")
+                } description: {
+                    Text("Connect an iPhone or iPad with a cable, unlock it and tap \"Trust\".\nWith Wi-Fi sync on, it also appears here when it's on the same Wi-Fi as this Mac.")
                 }
-                ForEach(store.devices) { d in DeviceCard(device: d) }
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(store.devices) { d in DeviceCard(device: d) }
+                    }
+                    .padding(20)
+                    .frame(maxWidth: 760, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                }
             }
-            .padding(20)
-            .frame(maxWidth: 760, alignment: .leading)
-            .frame(maxWidth: .infinity)
         }
         .navigationTitle("Devices")
         .toolbar {

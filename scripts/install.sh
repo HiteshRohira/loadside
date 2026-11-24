@@ -16,8 +16,19 @@ codesign --verify --deep "$NEW" >/dev/null 2>&1 || { echo "error: the new build 
 
 # Quit the app and stop the old daemon so their binaries can be replaced.
 osascript -e 'tell application id "dev.loadside.app" to quit' >/dev/null 2>&1 || true
-if [ -x "$DEST/Contents/MacOS/loadside-cli" ]; then "$DEST/Contents/MacOS/loadside-cli" daemon stop >/dev/null 2>&1 || true; fi
+# A daemon blocked on a Keychain dialog can't answer `daemon stop`, so don't
+# wait on it forever: ask, then terminate whatever is still running.
+if [ -x "$DEST/Contents/MacOS/loadside-cli" ]; then
+    "$DEST/Contents/MacOS/loadside-cli" daemon stop >/dev/null 2>&1 &
+    STOP_PID=$!
+fi
 for _ in $(seq 1 20); do pgrep -f "$DEST/Contents/MacOS/loadsided" >/dev/null || break; sleep 0.25; done
+if pgrep -f "$DEST/Contents/MacOS/loadsided" >/dev/null; then
+    pkill -TERM -f "$DEST/Contents/MacOS/loadsided" || true
+    for _ in $(seq 1 20); do pgrep -f "$DEST/Contents/MacOS/loadsided" >/dev/null || break; sleep 0.25; done
+    pkill -KILL -f "$DEST/Contents/MacOS/loadsided" || true
+fi
+[ -n "${STOP_PID:-}" ] && kill "$STOP_PID" 2>/dev/null || true
 
 [ -e "$DEST" ] && mv "$DEST" "$OLD"
 mv "$NEW" "$DEST"

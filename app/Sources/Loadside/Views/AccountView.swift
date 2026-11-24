@@ -129,7 +129,7 @@ struct AppIdsCard: View {
                     Text("Each new app (and each of its extensions) uses one. They free up 7 days after creation.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else if store.account?.isFree == false {
-                    Text("\(list.appIds.count) on your team. Paid accounts have no weekly limit.")
+                    Text("\(list.appIds.count) App ID\(list.appIds.count == 1 ? "" : "s") on your team. Paid accounts have no weekly limit.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 ForEach(list.appIds.sorted { ($0.expiresAt ?? .max) < ($1.expiresAt ?? .max) }) { a in
