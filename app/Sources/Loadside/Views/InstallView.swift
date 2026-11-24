@@ -57,6 +57,7 @@ struct InstallView: View {
                 Text("Install an app").font(.title2.weight(.semibold))
                 Text("Sign an IPA with your Apple ID and install it. Free accounts' apps last 7 days; Loadside refreshes them automatically.")
                     .font(.callout).foregroundStyle(.secondary)
+                FreeQuotaView(compact: true).padding(.top, 6)
             }
             Spacer()
             if path != nil {

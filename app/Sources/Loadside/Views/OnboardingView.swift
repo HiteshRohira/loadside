@@ -196,8 +196,9 @@ struct OnboardingView: View {
     private var device: some View {
         VStack(alignment: .leading, spacing: 16) {
             header("Connect your iPhone or iPad",
-                   "The first connection must use a cable so the device can trust this Mac. With Wi-Fi sync on, it works over the same Wi-Fi network after that.",
+                   "The cable is needed only the first time, so the device can trust this Mac.",
                    icon: "iphone.gen3.radiowaves.left.and.right")
+            CableOnceNote()
             Card {
                 Steps(items: [
                     "Connect the device to this Mac with a USB cable.",
@@ -251,6 +252,7 @@ struct OnboardingView: View {
             ForEach(checks(["wifi_sync"])) { c in Card { CheckRow(check: c) } }
             Text("This is the same setting as Finder's \"Show this iPhone when on Wi-Fi\". It needs the cable once to turn on.")
                 .font(.caption).foregroundStyle(.secondary)
+            CableOnceNote()
         }
     }
 
@@ -288,6 +290,7 @@ struct SetupView: View {
                 if let r = store.setup {
                     summary(r)
                     group("Essentials", r.checks.filter { $0.group == "essentials" })
+                    CableOnceNote()
                     group("Optional", r.checks.filter { $0.group == "optional" })
                 } else {
                     ProgressView("Checking…").frame(maxWidth: .infinity).padding(.top, 60)

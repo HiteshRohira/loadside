@@ -18,6 +18,8 @@ open ~/Applications/Loadside.app
 
 Requires the Rust toolchain and the Xcode command-line tools (for `swift build`). The Xcode IDE and an Apple developer membership are not needed.
 
+The build signs with the first code-signing certificate in your Keychain (an "Apple Development" one from Xcode works) so the Keychain remembers "Always Allow" across rebuilds; set `LOADSIDE_SIGN_IDENTITY` to pick one, or `-` for ad-hoc signing (macOS then asks again for Keychain access after every rebuild).
+
 ## First run
 
 The app opens a setup guide on first launch (reopen it any time from **Setup** in the sidebar). Every step shows a live check and the button that fixes it:
@@ -63,7 +65,8 @@ loadside logs -f | config [key value] | daemon status|install|restart
 ## What's better than Sideloadly
 
 - **Errors with fixes.** Apple, installd and lockdown errors are mapped to a plain message plus what to do (for example the free 3-app limit, 10 App IDs/week, certificate limit, a locked device, a missing Trust, an encrypted IPA). Raw details are still a click away.
-- **Free-account budget.** Shows App IDs left this week and when each frees up, shows how many IDs an IPA needs before you install it, and offers "Strip extensions" when you're short.
+- **Free-account budget, always visible.** The Install page, Apps list and menu bar show how many new apps you can still add this week and how many of the 3 per-device slots are free (refreshes don't count).
+- **Free-account details.** Shows App IDs left this week and when each frees up, shows how many IDs an IPA needs before you install it, and offers "Strip extensions" when you're short.
 - **Unattended auto-refresh.** Event-driven: it triggers the moment a device attaches over USB or Wi-Fi, plus a periodic check. It backs off after failures, skips apps you deleted from the phone, and sends a notification on success or failure.
 - **Keeps the original IPA** in its library, so refresh works even if you delete the download.
 - **Extension handling:** register all, reuse the main profile, or strip. It fixes extensions whose bundle IDs don't share the app's prefix instead of failing.

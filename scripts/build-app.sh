@@ -22,11 +22,14 @@ cp target/release/loadsided "$APP/Contents/MacOS/loadsided"
 # Named loadside-cli: on case-insensitive APFS "loadside" would clobber "Loadside".
 cp target/release/loadside "$APP/Contents/MacOS/loadside-cli"
 
-if [ ! -f "$ROOT/dist/AppIcon.icns" ]; then
+ART="$ROOT/app/Sources/Loadside/IconArt.swift"
+if [ ! -f "$ROOT/dist/AppIcon.icns" ] || [ "$ART" -nt "$ROOT/dist/AppIcon.icns" ]; then
   echo "==> Rendering icon"
-  ICONSET="$(mktemp -d)/AppIcon.iconset"
-  swift "$ROOT/scripts/make-icon.swift" "$ICONSET"
-  iconutil -c icns "$ICONSET" -o "$ROOT/dist/AppIcon.icns"
+  TMP="$(mktemp -d)"
+  swiftc -O -parse-as-library "$ROOT/scripts/make-icon.swift" "$ART" -o "$TMP/make-icon"
+  "$TMP/make-icon" "$TMP/AppIcon.iconset"
+  iconutil -c icns "$TMP/AppIcon.iconset" -o "$ROOT/dist/AppIcon.icns"
+  rm -rf "$TMP"
 fi
 cp "$ROOT/dist/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
@@ -61,10 +64,25 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> Ad-hoc signing"
-codesign --force --sign - --identifier dev.loadside.daemon "$APP/Contents/MacOS/loadsided"
-codesign --force --sign - --identifier dev.loadside.cli "$APP/Contents/MacOS/loadside-cli"
-codesign --force --sign - "$APP"
+# Keychain remembers "Always Allow" per code identity. An ad-hoc signature
+# changes with every build, so each rebuild would ask again for every item
+# (password, anisette identity, signing key). A real certificate keeps the
+# identity stable. Override with LOADSIDE_SIGN_IDENTITY ("-" for ad-hoc).
+SIGN_ID="${LOADSIDE_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_ID" ]; then
+    SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep -E '"(Developer ID Application|Apple Development|Mac Developer):' \
+        | head -1 | awk '{print $2}')
+fi
+if [ -z "$SIGN_ID" ] || [ "$SIGN_ID" = "-" ]; then
+    SIGN_ID="-"
+    echo "==> Ad-hoc signing (no signing certificate found; Keychain will ask again after each rebuild)"
+else
+    echo "==> Signing with certificate ${SIGN_ID:0:8}…"
+fi
+codesign --force --timestamp=none --sign "$SIGN_ID" --identifier dev.loadside.daemon "$APP/Contents/MacOS/loadsided"
+codesign --force --timestamp=none --sign "$SIGN_ID" --identifier dev.loadside.cli "$APP/Contents/MacOS/loadside-cli"
+codesign --force --timestamp=none --sign "$SIGN_ID" "$APP"
 
 echo "==> Done: $APP"
 du -sh "$APP" | awk '{print "    size: "$1}'

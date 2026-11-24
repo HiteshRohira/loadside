@@ -257,6 +257,7 @@ final class Store {
             if j.status == .succeeded, j.kind == .install || j.kind == .refresh {
                 // Account quotas changed.
                 appIds = nil
+                if account?.isFree == true { Task { await loadAppIds() } }
             }
             if j.status == .succeeded, j.kind == .export { finishExport(j) }
         case "devices":
@@ -323,6 +324,24 @@ final class Store {
         if let tt { teams = tt }
         if let aa { appIds = aa }
         if let cc { certs = cc }
+    }
+
+    /// Free accounts: make sure the weekly App ID budget is loaded.
+    func ensureQuota() async {
+        if account?.isFree == true, appIds == nil, connection == .connected { await loadAppIds() }
+    }
+
+    /// Free accounts can keep 3 sideloaded apps per device.
+    static let freeSlotsPerDevice = 3
+
+    /// Apps Loadside tracks on the device with the most of them.
+    var slotsUsed: (device: String, used: Int)? {
+        let live = apps.filter { $0.onDevice != false }
+        let byDevice = Dictionary(grouping: live, by: \.deviceName)
+        guard let top = byDevice.max(by: { $0.value.count < $1.value.count }) else {
+            return devices.first.map { ($0.name, 0) }
+        }
+        return (top.key, top.value.count)
     }
 
     func loadAppIds() async { appIds = await run { try await client.call("app_ids", as: AppIdList.self) } ?? appIds }

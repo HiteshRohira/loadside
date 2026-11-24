@@ -70,6 +70,8 @@ pub struct Session {
     pub dev: DeveloperSession,
     pub teams: Vec<DeveloperTeam>,
     pub team: DeveloperTeam,
+    /// Teams Apple marks as free ("Xcode Free Provisioning Program").
+    pub free_team_ids: Vec<String>,
     pub token_expires_at: Option<i64>,
     pub logged_in_at: i64,
 }
@@ -82,13 +84,47 @@ pub struct TeamSummary {
     pub is_free: bool,
 }
 
-pub fn team_is_free(t: &DeveloperTeam) -> bool {
+/// Fallback when the membership list couldn't be read. Free teams used to be
+/// named "<name> (Personal Team)"; Apple now names them after the person and
+/// reports type "Individual", exactly like paid individual teams.
+fn team_name_says_free(t: &DeveloperTeam) -> bool {
     t.name.as_deref().is_some_and(|n| n.contains("Personal Team"))
         || t.r#type.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("free") || k.contains("Personal"))
 }
 
-pub fn summarize_team(t: &DeveloperTeam) -> TeamSummary {
-    TeamSummary { team_id: t.team_id.clone(), name: t.name.clone(), kind: t.r#type.clone(), is_free: team_is_free(t) }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTeam {
+    team_id: String,
+    #[serde(default)]
+    memberships: Vec<RawMembership>,
+}
+
+#[derive(Deserialize)]
+struct RawMembership {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Free teams have a single membership named "Xcode Free Provisioning
+/// Program"; paid ones list "Apple Developer Program" (same rule AltStore
+/// uses). isideload's team type doesn't expose memberships, so ask directly.
+async fn free_team_ids(dev: &mut DeveloperSession, teams: &[DeveloperTeam]) -> Vec<String> {
+    use isideload::dev::device_type::{DeveloperDeviceType, dev_url};
+    match dev.send_dev_request::<Vec<RawTeam>>(&dev_url("listTeams", DeveloperDeviceType::Any), None, "teams").await {
+        Ok(raw) => raw
+            .into_iter()
+            .filter(|t| {
+                t.memberships.len() == 1
+                    && t.memberships[0].name.as_deref().is_some_and(|n| n.to_lowercase().contains("free"))
+            })
+            .map(|t| t.team_id)
+            .collect(),
+        Err(e) => {
+            tracing::warn!("Couldn't read team memberships, guessing free/paid from the team name: {e}");
+            teams.iter().filter(|t| team_name_says_free(t)).map(|t| t.team_id.clone()).collect()
+        }
+    }
 }
 
 impl Session {
@@ -108,8 +144,19 @@ impl Session {
             name: self.name.clone(),
             team_id: Some(self.team.team_id.clone()),
             team_name: self.team.name.clone(),
-            is_free: Some(team_is_free(&self.team)),
+            is_free: Some(self.is_free(&self.team)),
         }
+    }
+
+    pub fn is_free(&self, t: &DeveloperTeam) -> bool {
+        self.free_team_ids.contains(&t.team_id)
+    }
+
+    pub fn team_summaries(&self) -> Vec<TeamSummary> {
+        self.teams
+            .iter()
+            .map(|t| TeamSummary { team_id: t.team_id.clone(), name: t.name.clone(), kind: t.r#type.clone(), is_free: self.is_free(t) })
+            .collect()
     }
 
     pub fn select_team(&mut self, team_id: &str) -> Result<()> {
@@ -162,6 +209,7 @@ pub async fn login<C: TwoFactorCallback>(
     let token_expires_at = normalize_expiry(token.expiry);
     let mut dev = DeveloperSession::new(token, adsid, account.grandslam_client.clone(), account.anisette_generator.clone());
     let teams = dev.list_teams().await.rc()?;
+    let free_team_ids = free_team_ids(&mut dev, &teams).await;
     let team = preferred_team
         .and_then(|id| teams.iter().find(|t| t.team_id == id))
         .or_else(|| teams.first())
@@ -173,6 +221,7 @@ pub async fn login<C: TwoFactorCallback>(
         dev,
         teams,
         team,
+        free_team_ids,
         token_expires_at,
         logged_in_at: crate::now(),
     })

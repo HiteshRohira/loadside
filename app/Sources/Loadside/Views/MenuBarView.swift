@@ -36,6 +36,10 @@ struct MenuBarView: View {
                     }
                 }
                 Divider()
+                if store.account?.isFree == true {
+                    section("This week") { FreeQuotaView(compact: true) }
+                    Divider()
+                }
                 section("Apps") {
                     if store.apps.isEmpty {
                         Text("Nothing installed yet").font(.callout).foregroundStyle(.secondary)
@@ -181,6 +185,10 @@ struct MenuBarLabel: View {
         let busy = !store.activeJobs.isEmpty
         let attention = store.connection != .connected || (store.setup?.checks.contains(where: \.isBlocking) ?? false)
             || store.apps.contains { ($0.expiresAt ?? .max) < Int(Date().timeIntervalSince1970) + 24 * 3600 }
-        Image(systemName: busy ? "arrow.triangle.2.circlepath" : attention ? "iphone.gen3.badge.exclamationmark" : "apps.iphone")
+        if busy {
+            Image(systemName: "arrow.triangle.2.circlepath")
+        } else {
+            Image(nsImage: IconArt.menuBarImage(attention: attention))
+        }
     }
 }

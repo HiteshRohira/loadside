@@ -89,3 +89,47 @@ struct Tag: View {
             .foregroundStyle(color)
     }
 }
+
+
+/// Free Apple IDs: what's left this week. New apps (and each of their
+/// extensions) use App IDs, 10 per rolling 7 days; each device holds 3
+/// sideloaded apps. Refreshing an installed app uses neither.
+struct FreeQuotaView: View {
+    @Environment(Store.self) private var store
+    var compact = false
+
+    var body: some View {
+        if store.account?.isFree == true {
+            let ids = store.appIds
+            let avail = ids?.availableQuantity
+            let nextFree = ids?.appIds.compactMap(\.expiresAt).min()
+            let slots = store.slotsUsed
+            let slotsLeft = slots.map { max(0, Store.freeSlotsPerDevice - $0.used) }
+            VStack(alignment: .leading, spacing: compact ? 3 : 6) {
+                HStack(spacing: compact ? 10 : 16) {
+                    if let avail {
+                        Label("\(avail) new app\(avail == 1 ? "" : "s") left this week", systemImage: "number.circle")
+                            .foregroundStyle(avail == 0 ? .red : avail < 3 ? .orange : .primary)
+                    } else {
+                        Label("Checking this week's budget…", systemImage: "number.circle").foregroundStyle(.secondary)
+                    }
+                    if let slotsLeft, let slots {
+                        Label("\(slotsLeft) of \(Store.freeSlotsPerDevice) app slots free\(compact ? "" : " on \(slots.device)")", systemImage: "square.grid.2x2")
+                            .foregroundStyle(slotsLeft == 0 ? .orange : .primary)
+                    }
+                }
+                Text(footnote(avail: avail, nextFree: nextFree))
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(compact ? .caption : .callout)
+            .task(id: store.account?.email) { await store.ensureQuota() }
+        }
+    }
+
+    private func footnote(avail: Int?, nextFree: Int?) -> String {
+        var parts = ["Refreshes are unlimited; only new apps (and their extensions) use the weekly budget of 10."]
+        if avail == 0, let nextFree { parts.append("The next one frees \(Fmt.rel(nextFree)).") }
+        return parts.joined(separator: " ")
+    }
+}

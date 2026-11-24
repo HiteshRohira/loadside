@@ -262,7 +262,7 @@ impl Engine {
         }
         self.needs_interactive_login.store(false, Ordering::SeqCst);
         let info = session.account_info();
-        let teams: Vec<_> = session.teams.iter().map(account::summarize_team).collect();
+        let teams: Vec<_> = session.team_summaries();
         {
             let mut st = self.state.lock().unwrap();
             st.account = Some(info.clone());
@@ -332,6 +332,18 @@ impl Engine {
                 self.logged_in.store(true, Ordering::SeqCst);
                 drop(guard);
                 self.needs_interactive_login.store(false, Ordering::SeqCst);
+                // Keep the saved account in step with what Apple reports now
+                // (name, team, free/paid).
+                let info = s.account_info();
+                let changed = {
+                    let mut st = self.state.lock().unwrap();
+                    let changed = st.account.as_ref() != Some(&info);
+                    st.account = Some(info);
+                    changed
+                };
+                if changed {
+                    self.save_state();
+                }
                 self.emit_account(true);
                 Ok(s)
             }
@@ -375,7 +387,7 @@ impl Engine {
         let s = self.session(false).await?;
         Ok(json!({
             "selected": s.team.team_id,
-            "teams": s.teams.iter().map(account::summarize_team).collect::<Vec<_>>(),
+            "teams": s.team_summaries(),
         }))
     }
 

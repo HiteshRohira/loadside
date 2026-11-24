@@ -16,7 +16,10 @@ struct AppsView: View {
                             AppRow(app: app, job: store.jobs.last { $0.appId == app.id && $0.isActive }, onRemove: { removing = app })
                         }
                     } header: {
-                        summary
+                        VStack(alignment: .leading, spacing: 10) {
+                            summary
+                            FreeQuotaView()
+                        }
                     }
                 }
                 .listStyle(.inset)

@@ -119,3 +119,23 @@ struct Steps: View {
         }
     }
 }
+
+
+/// The one thing people get wrong about Wi-Fi: the cable is a one-time step,
+/// and a locked iPhone isn't "disconnected", just asleep.
+struct CableOnceNote: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "cable.connector").foregroundStyle(.tint).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Cable once, then Wi-Fi").font(.callout.weight(.semibold))
+                Text("After the first connection Loadside remembers your device. A locked iPhone drops off Wi-Fi; unlock it and it reconnects. No need to plug in again.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
