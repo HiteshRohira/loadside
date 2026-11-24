@@ -187,6 +187,8 @@ impl Engine {
 
         // Device
         let usable: Vec<&DeviceInfo> = devices.iter().filter(|d| d.paired).collect();
+        // Most recently seen device this Mac has paired with, if none is visible.
+        let known = if devices.is_empty() { st.known_devices.iter().max_by_key(|k| k.last_seen) } else { None };
         let device_check = if let Some(d) = usable.first() {
             SetupCheck::new("device", E, "iPhone or iPad", CheckStatus::Ok, format!("{} connected ({}{}).", d.name, if d.connection == "wifi" { "Wi-Fi" } else { "USB" }, d.ios_version.as_deref().map(|v| format!(", iOS {v}")).unwrap_or_default()))
         } else if let Some(d) = devices.first() {
@@ -194,6 +196,15 @@ impl Engine {
                 .detail("Unlock the device. If it asks \"Trust This Computer?\", tap Trust and enter your passcode. If it never asks, unplug and plug it back in, or select it in Finder once.")
                 .action(SetupAction::new("refresh_devices", "Check again").primary())
                 .action(SetupAction::new("open_finder", "Open Finder"))
+        } else if let Some(k) = known {
+            // Paired before; it's just not visible (an asleep iPhone drops off
+            // Wi-Fi). Nothing to set up, so this isn't blocking.
+            SetupCheck::new("device", E, "iPhone or iPad", CheckStatus::Warning, format!("{} is set up, but not reachable right now.", k.name))
+                .detail(format!(
+                    "iPhones only show up over Wi-Fi while they're awake and on the same network as this Mac. Unlock it, or plug it in, and it reconnects on its own. Last seen {}.",
+                    ago(k.last_seen)
+                ))
+                .action(SetupAction::new("refresh_devices", "Check again").primary())
         } else {
             SetupCheck::new("device", E, "iPhone or iPad", CheckStatus::Action, "Connect your iPhone or iPad with a USB cable.")
                 .detail("Unlock it and tap Trust when it asks. If Wi-Fi sync is on and the device is on the same Wi-Fi as this Mac, it shows up without the cable too.")
@@ -203,7 +214,9 @@ impl Engine {
 
         // Developer Mode (iOS 16+)
         let dm_devices: Vec<&DeviceInfo> = usable.iter().copied().filter(|d| d.ios_major().is_some_and(|v| v >= 16)).collect();
-        let dm = if usable.is_empty() {
+        let dm = if let (true, Some(k)) = (usable.is_empty(), known.filter(|k| k.developer_mode == Some(true))) {
+            SetupCheck::new("developer_mode", E, "Developer Mode", CheckStatus::Ok, format!("On for {} (when last connected).", k.name))
+        } else if usable.is_empty() {
             SetupCheck::new("developer_mode", E, "Developer Mode", CheckStatus::Pending, "Checked once a device is connected.")
         } else if let Some(d) = dm_devices.iter().find(|d| d.developer_mode == Some(false)) {
             let mut c = SetupCheck::new("developer_mode", E, "Developer Mode", CheckStatus::Action, format!("Turn on Developer Mode on {}.", d.name))
@@ -233,7 +246,9 @@ impl Engine {
         );
 
         // Wi-Fi sync (optional)
-        let wifi = if usable.is_empty() {
+        let wifi = if let (true, Some(k)) = (usable.is_empty(), known.filter(|k| k.wifi_sync == Some(true))) {
+            SetupCheck::new("wifi_sync", O, "Wi-Fi sync", CheckStatus::Ok, format!("On for {}. It shows up whenever it's awake on this Wi-Fi.", k.name))
+        } else if usable.is_empty() {
             SetupCheck::new("wifi_sync", O, "Wi-Fi sync", CheckStatus::Pending, "Checked once a device is connected.")
         } else if let Some(d) = usable.iter().find(|d| d.connection == "wifi") {
             SetupCheck::new("wifi_sync", O, "Wi-Fi sync", CheckStatus::Ok, format!("{} is connected over Wi-Fi.", d.name))
@@ -254,4 +269,16 @@ impl Engine {
         let ready = !checks.iter().any(|c| c.is_blocking());
         SetupReport { checks, ready, onboarding_done: cfg.onboarding_done, generated_at: loadside_core::now() }
     }
+}
+
+/// "5 minutes ago", "3 hours ago", "2 days ago".
+fn ago(ts: i64) -> String {
+    let d = (loadside_core::now() - ts).max(0);
+    let (n, unit) = match d {
+        0..=59 => return "just now".into(),
+        60..=3599 => (d / 60, "minute"),
+        3600..=86_399 => (d / 3600, "hour"),
+        _ => (d / 86_400, "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }

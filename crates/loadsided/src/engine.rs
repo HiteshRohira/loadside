@@ -698,8 +698,15 @@ impl Engine {
         let devs = self.devices();
         match devs.as_slice() {
             [one] => Ok(one.udid.clone()),
-            [] => Err(f("device_not_found", "No device connected.")
-                .with_hint("Connect your iPhone/iPad with a cable, unlock it and tap \"Trust\". With Wi-Fi sync on, it also shows up over the same Wi-Fi network.")),
+            [] => {
+                let known = self.state.lock().unwrap().known_devices.iter().max_by_key(|k| k.last_seen).map(|k| k.name.clone());
+                Err(match known {
+                    Some(name) => f("device_not_found", &format!("{name} isn't reachable right now."))
+                        .with_hint("Unlock it and keep it on the same Wi-Fi as this Mac (an asleep iPhone drops off Wi-Fi), or plug it in. Then try again."),
+                    None => f("device_not_found", "No device connected.")
+                        .with_hint("Connect your iPhone/iPad with a cable, unlock it and tap \"Trust\". With Wi-Fi sync on, it also shows up over the same Wi-Fi network."),
+                })
+            }
             _ => Err(f("choose_device", "More than one device is connected.").with_hint("Pick which device to install to.")),
         }
     }
@@ -1089,6 +1096,7 @@ impl Engine {
             devs.insert(info.udid.clone(), info);
         }
         self.emit(Event::Devices { devices: self.devices() });
+        self.remember_devices();
         if paired {
             self.sync_on_device(&dev.udid).await;
         }
@@ -1133,7 +1141,47 @@ impl Engine {
         *self.mux.lock().unwrap() = mux;
         let list = self.devices();
         self.emit(Event::Devices { devices: list.clone() });
+        self.remember_devices();
         Ok(list)
+    }
+
+    /// Record paired devices (and what we learned about them) in the state so
+    /// Setup knows a phone that's merely asleep has already been set up.
+    pub(crate) fn remember_devices(&self) {
+        let now = loadside_core::now();
+        let seen: Vec<DeviceInfo> = self.devices().into_iter().filter(|d| d.paired && d.problem.is_none()).collect();
+        if seen.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut st = self.state.lock().unwrap();
+            for d in seen {
+                let wifi_sync = if d.connection == "wifi" { Some(true) } else { d.wifi_sync };
+                let k = match st.known_devices.iter_mut().position(|k| k.udid == d.udid) {
+                    Some(i) => &mut st.known_devices[i],
+                    None => {
+                        st.known_devices.push(loadside_core::state::KnownDevice { udid: d.udid.clone(), ..Default::default() });
+                        changed = true;
+                        st.known_devices.last_mut().unwrap()
+                    }
+                };
+                let before = k.clone();
+                k.name = d.name.clone();
+                k.model = d.model.clone().or(k.model.take());
+                k.ios_version = d.ios_version.clone().or(k.ios_version.take());
+                k.developer_mode = d.developer_mode.or(k.developer_mode);
+                k.wifi_sync = wifi_sync.or(k.wifi_sync);
+                // Don't rewrite state.json on every attach just for the time.
+                if now - k.last_seen > 3600 {
+                    k.last_seen = now;
+                }
+                changed |= *k != before;
+            }
+        }
+        if changed {
+            self.save_state();
+        }
     }
 
     /// Update `on_device` for our records on this device.

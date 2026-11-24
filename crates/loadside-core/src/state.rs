@@ -127,11 +127,26 @@ impl Default for AppRecord {
     }
 }
 
+/// A device this Mac has already paired with. Remembered so a phone that's
+/// simply asleep (and so not visible over Wi-Fi) isn't treated as "not set up".
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct KnownDevice {
+    pub udid: String,
+    pub name: String,
+    pub model: Option<String>,
+    pub ios_version: Option<String>,
+    pub developer_mode: Option<bool>,
+    pub wifi_sync: Option<bool>,
+    pub last_seen: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct State {
     pub account: Option<AccountInfo>,
     pub apps: Vec<AppRecord>,
+    pub known_devices: Vec<KnownDevice>,
 }
 
 impl State {
