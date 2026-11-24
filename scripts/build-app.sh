@@ -22,16 +22,8 @@ cp target/release/loadsided "$APP/Contents/MacOS/loadsided"
 # Named loadside-cli: on case-insensitive APFS "loadside" would clobber "Loadside".
 cp target/release/loadside "$APP/Contents/MacOS/loadside-cli"
 
-ART="$ROOT/app/Sources/Loadside/IconArt.swift"
-if [ ! -f "$ROOT/dist/AppIcon.icns" ] || [ "$ART" -nt "$ROOT/dist/AppIcon.icns" ]; then
-  echo "==> Rendering icon"
-  TMP="$(mktemp -d)"
-  swiftc -O -parse-as-library "$ROOT/scripts/make-icon.swift" "$ART" -o "$TMP/make-icon"
-  "$TMP/make-icon" "$TMP/AppIcon.iconset"
-  iconutil -c icns "$TMP/AppIcon.iconset" -o "$ROOT/dist/AppIcon.icns"
-  rm -rf "$TMP"
-fi
-cp "$ROOT/dist/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# The app icon is pre-rendered from docs/icons/src (scripts/render-icon.sh).
+cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
