@@ -24,6 +24,7 @@ cp target/release/loadside "$APP/Contents/MacOS/loadside-cli"
 
 # The app icon is pre-rendered from docs/icons/src (scripts/render-icon.sh).
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/assets/Assets.car" "$APP/Contents/Resources/Assets.car"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -35,6 +36,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>dev.loadside.app</string>
     <key>CFBundleExecutable</key><string>Loadside</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>

@@ -6,3 +6,5 @@
 /docs/media/
 /docs/posters/
 *.ipa
+# Icon explorations (local only; the chosen icon lives in docs/icons/final)
+/docs/icons/round2/

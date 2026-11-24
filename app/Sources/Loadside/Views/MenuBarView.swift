@@ -185,10 +185,8 @@ struct MenuBarLabel: View {
         let busy = !store.activeJobs.isEmpty
         let attention = store.connection != .connected || (store.setup?.checks.contains(where: \.isBlocking) ?? false)
             || store.apps.contains { ($0.expiresAt ?? .max) < Int(Date().timeIntervalSince1970) + 24 * 3600 }
-        if busy {
-            Image(systemName: "arrow.triangle.2.circlepath")
-        } else {
-            Image(nsImage: IconArt.menuBarImage(attention: attention))
-        }
+        // Same glyph as the app icon; a dot means something needs a look.
+        // (Progress shows in the panel, not by swapping the icon.)
+        Image(nsImage: IconArt.menuBarImage(attention: attention && !busy))
     }
 }

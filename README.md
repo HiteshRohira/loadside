@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/AppIcon.png" width="128" alt="Loadside icon"></p>
+
 # Loadside
 
 A Sideloadly-style IPA sideloader for macOS: sign iOS apps with your (free or paid) Apple ID and install them over USB or Wi-Fi, then keep them signed in the background. **No Xcode required.**
