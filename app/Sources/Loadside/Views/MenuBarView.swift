@@ -46,6 +46,7 @@ struct MenuBarView: View {
                     }
                     ForEach(sortedApps.prefix(6)) { app in
                         HStack(spacing: 8) {
+                            AppIconView(path: app.sourcePath, name: app.name, size: 22)
                             Text(app.name).lineLimit(1)
                             Spacer()
                             ExpiryBadge(expiresAt: app.expiresAt)
@@ -58,7 +59,7 @@ struct MenuBarView: View {
                         }
                     }
                     if store.apps.count > 6 {
-                        Button("Show all \(store.apps.count) apps…") { open("apps") }.buttonStyle(.link).font(.callout)
+                        Button("Show all \(store.apps.count) apps…") { open(nil) }.buttonStyle(.link).font(.callout)
                     }
                 }
                 Divider()
@@ -67,7 +68,7 @@ struct MenuBarView: View {
                 if store.connection == .connected && !store.apps.isEmpty {
                     MenuButton("Refresh All Apps", icon: "arrow.clockwise") { Task { await store.refreshAll() } }
                 }
-                MenuButton("Install an App…", icon: "square.and.arrow.down.on.square") { open("install") }
+                MenuButton("Install an App…", icon: "plus") { open("install") }
                 MenuButton("Open Loadside", icon: "macwindow") { open(nil) }
                 Divider().padding(.vertical, 4)
                 MenuButton("Quit Loadside", icon: "power") { NSApp.terminate(nil) }
@@ -181,6 +182,7 @@ private struct MenuButton: View {
 /// The menu bar icon reflects whether anything needs attention.
 struct MenuBarLabel: View {
     @Environment(Store.self) private var store
+    @Environment(\.openWindow) private var openWindow
     var body: some View {
         let busy = !store.activeJobs.isEmpty
         let attention = store.connection != .connected || (store.setup?.checks.contains(where: \.isBlocking) ?? false)
@@ -188,5 +190,6 @@ struct MenuBarLabel: View {
         // Same glyph as the app icon; a dot means something needs a look.
         // (Progress shows in the panel, not by swapping the icon.)
         Image(nsImage: IconArt.menuBarImage(attention: attention && !busy))
+            .task { AppDelegate.openMainWindow = { openWindow(id: "main") } }
     }
 }

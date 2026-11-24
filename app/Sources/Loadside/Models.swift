@@ -94,16 +94,16 @@ enum ExtensionsMode: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .registerAll: "Register all"
-        case .reuseMain: "Reuse main"
-        case .strip: "Strip"
+        case .registerAll: "Include"
+        case .reuseMain: "Share App ID"
+        case .strip: "Leave Out"
         }
     }
     var explanation: String {
         switch self {
-        case .registerAll: "Each extension gets its own App ID. Most compatible, but each one counts toward the free limit of 10 App IDs per week."
-        case .reuseMain: "Extensions share the main app's profile. Uses 1 App ID; some extensions (widgets, share sheets) may not work."
-        case .strip: "Removes all extensions. Uses 1 App ID and avoids most install errors."
+        case .registerAll: "Each widget and extension gets its own App ID, so everything works. On a free Apple ID each one uses 1 of your 10 App IDs a week."
+        case .reuseMain: "Widgets and extensions use the app's App ID. Uses just 1, but some (widgets, share sheets) may not work."
+        case .strip: "Removes widgets and extensions. Uses just 1 App ID and avoids most install errors."
         }
     }
 }

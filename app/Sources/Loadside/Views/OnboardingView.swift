@@ -82,7 +82,7 @@ struct OnboardingView: View {
                 .buttonStyle(.plain)
             }
             Spacer()
-            Text("You can reopen this guide from Setup in the sidebar.")
+            Text("Reopen this guide anytime from Help → Setup Guide.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(16)
@@ -260,8 +260,8 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 16) {
             header(store.setup?.ready == true ? "You're all set" : "Almost there",
                    store.setup?.ready == true
-                       ? "Drop an IPA on the Install page. Loadside keeps it signed in the background."
-                       : "Some essentials still need attention. You can finish them later from Setup in the sidebar.",
+                       ? "Drop an IPA onto the Loadside window. It stays signed in the background."
+                       : "Some essentials still need attention. The main window shows what's left.",
                    icon: store.setup?.ready == true ? "checkmark.seal" : "list.bullet.clipboard")
             Card {
                 ForEach(store.setup?.checks ?? []) { c in
@@ -279,68 +279,78 @@ struct OnboardingView: View {
     }
 }
 
-/// The checklist page in the sidebar.
-struct SetupView: View {
+/// Essentials + optional checks, each with the button that fixes it.
+struct SetupChecklist: View {
     @Environment(Store.self) private var store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let r = store.setup {
+                group(r.checks.filter { $0.group == "essentials" })
+                CableOnceNote()
+                let optional = r.checks.filter { $0.group == "optional" }
+                if !optional.isEmpty {
+                    Text("Optional").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                    group(optional)
+                }
+            } else {
+                ProgressView("Checking…").frame(maxWidth: .infinity).padding(.vertical, 30)
+            }
+        }
+    }
+
+    private func group(_ checks: [SetupCheck]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(checks.enumerated()), id: \.element.id) { i, c in
+                if i > 0 { Divider() }
+                CheckRow(check: c)
+            }
+        }
+        .surface(cornerRadius: 14, padding: 14)
+    }
+}
+
+/// The checklist as a sheet, opened from the home screen's "Fix" banner.
+struct SetupSheet: View {
+    @Environment(Store.self) private var store
+    @Environment(\.dismiss) private var dismiss
     @State private var refreshing = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                if let r = store.setup {
-                    summary(r)
-                    group("Essentials", r.checks.filter { $0.group == "essentials" })
-                    CableOnceNote()
-                    group("Optional", r.checks.filter { $0.group == "optional" })
-                } else {
-                    ProgressView("Checking…").frame(maxWidth: .infinity).padding(.top, 60)
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                let ready = store.setup?.ready == true
+                Image(systemName: ready ? "checkmark.seal.fill" : "list.bullet.clipboard")
+                    .font(.system(size: 26)).foregroundStyle(ready ? .green : .orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ready ? "Ready to install" : "Finish setting up").font(.title3.weight(.semibold))
+                    Text(ready ? "Everything essential is done." : "Each item says what to do.")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
+                Spacer()
             }
             .padding(20)
-            .frame(maxWidth: 760, alignment: .leading)
-            .frame(maxWidth: .infinity)
-        }
-        .navigationTitle("Setup")
-        .toolbar {
-            ToolbarItem {
-                Button { store.reopenOnboarding() } label: { Label("Setup Guide", systemImage: "sparkles") }
-            }
-            ToolbarItem {
+            Divider()
+            ScrollView { SetupChecklist().padding(20) }
+            Divider()
+            HStack {
+                Button("Setup Guide") { dismiss(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { store.reopenOnboarding() } }
+                Spacer()
                 Button {
                     Task { refreshing = true; await store.loadSetup(force: true); refreshing = false }
-                } label: { Label("Check Again", systemImage: "arrow.clockwise") }
+                } label: { Text(refreshing ? "Checking…" : "Check Again") }
                     .disabled(refreshing)
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction).primaryButton()
             }
+            .controlSize(.large)
+            .padding(16)
         }
+        .frame(width: 560, height: 600)
+        .presentsPrompts()
         .task {
             while !Task.isCancelled {
                 await store.loadSetup()
-                try? await Task.sleep(for: .seconds(6))
-            }
-        }
-    }
-
-    private func summary(_ r: SetupReport) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: r.ready ? "checkmark.seal.fill" : "exclamationmark.circle.fill")
-                .font(.system(size: 28)).foregroundStyle(r.ready ? .green : .orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(r.ready ? "Ready to install" : "\(r.blockingCount) thing\(r.blockingCount == 1 ? "" : "s") to set up")
-                    .font(.title3.weight(.semibold))
-                Text(r.ready ? "Drop an IPA on the Install page." : "Each item below says what to do.")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func group(_ title: String, _ checks: [SetupCheck]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.headline)
-            Card {
-                ForEach(Array(checks.enumerated()), id: \.element.id) { i, c in
-                    if i > 0 { Divider() }
-                    CheckRow(check: c)
-                }
+                try? await Task.sleep(for: .seconds(5))
             }
         }
     }

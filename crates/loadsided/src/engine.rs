@@ -1238,10 +1238,20 @@ impl Engine {
 
     pub async fn scheduler(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<()>) {
         loop {
-            let interval = self.config().check_interval_minutes as u64 * 60;
-            self.next_check_at.store(loadside_core::now() + interval as i64, Ordering::Relaxed);
+            let interval = self.config().check_interval_minutes as i64 * 60;
+            let deadline = loadside_core::now() + interval;
+            self.next_check_at.store(deadline, Ordering::Relaxed);
+            // Wait by the wall clock: tokio's timer stops while the Mac sleeps,
+            // so one long sleep would run the check hours late after a night
+            // asleep. Short ticks catch up within a minute of waking.
+            let until_deadline = async {
+                while loadside_core::now() < deadline {
+                    let left = (deadline - loadside_core::now()).clamp(1, 60) as u64;
+                    tokio::time::sleep(Duration::from_secs(left)).await;
+                }
+            };
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+                _ = until_deadline => {}
                 Some(_) = rx.recv() => {
                     // Debounce bursts (Wi-Fi devices flap, several attach events...).
                     tokio::time::sleep(Duration::from_secs(5)).await;

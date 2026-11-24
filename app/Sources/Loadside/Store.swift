@@ -26,8 +26,10 @@ final class Store {
     var showOnboarding = false
     /// Why the background service couldn't be started (from `daemon install`).
     var serviceError: ServiceError?
-    /// Sidebar navigation requests from views (e.g. "Sign in" in a checklist).
+    /// Navigation requests from views and the menu bar ("install", "setup", "account"...).
     var navigate: String?
+    /// A file to open in the install sheet (e.g. "Choose Different File…").
+    var pendingInstallURL: URL?
 
     struct ServiceError: Equatable {
         var code: String
