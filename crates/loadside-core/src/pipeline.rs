@@ -216,3 +216,7 @@ pub async fn run(
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
+
+pub fn new_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}

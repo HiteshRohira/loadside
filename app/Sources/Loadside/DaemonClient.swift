@@ -18,7 +18,7 @@ final class DaemonClient: @unchecked Sendable {
     /// Calls that may wait for a sign-in (and its 2FA code) take longer.
     /// Calls that can wait on Apple, a device or a sign-in in progress
     /// (the daemon has its own, shorter limits for each).
-    static let longCalls: Set<String> = ["login", "logout", "teams", "select_team", "app_ids", "delete_app_id", "certs", "revoke_cert", "remove_app", "reveal_developer_mode", "enable_wifi_sync"]
+    static let longCalls: Set<String> = ["login", "logout", "teams", "select_team", "app_ids", "delete_app_id", "certs", "revoke_cert", "remove_app", "reveal_developer_mode", "enable_wifi_sync", "github_download", "check_updates", "set_app_github"]
     private static let maxLine = 64 * 1024 * 1024
 
     var onEvent: (@Sendable (JSON) -> Void)?

@@ -13,6 +13,7 @@ pub mod config;
 pub mod deb;
 pub mod device;
 pub mod errors;
+pub mod github;
 pub mod ipa;
 pub mod macho;
 pub mod paths;

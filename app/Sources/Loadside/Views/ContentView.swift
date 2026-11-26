@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct PendingInstall: Identifiable {
     let id = UUID()
     let url: URL
+    var github: GitHubSource? = nil
 }
 
 /// The whole app in one window: device status, your apps, and a way to add more.
@@ -13,19 +14,20 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
     @State private var pending: PendingInstall?
+    @State private var showGitHubInstall = false
     @State private var showSetup = false
     @State private var detailAppId: String?
     @State private var dropTargeted = false
 
     static let ipaType = UTType(filenameExtension: "ipa") ?? .data
 
-    private var anySheetOpen: Bool { pending != nil || showSetup || detailAppId != nil }
+    private var anySheetOpen: Bool { pending != nil || showGitHubInstall || showSetup || detailAppId != nil }
 
     var body: some View {
         Group {
             switch store.connection {
             case .connected:
-                HomeView(add: chooseFile, openSetup: { showSetup = true }, openApp: { detailAppId = $0.id })
+                HomeView(add: chooseFile, addFromGitHub: openGitHubInstall, openSetup: { showSetup = true }, openApp: { detailAppId = $0.id })
             case .connecting:
                 ProgressView("Connecting to the Loadside service…").frame(maxWidth: .infinity, maxHeight: .infinity)
             case .unavailable(let why):
@@ -41,13 +43,29 @@ struct ContentView: View {
                 ActivityButton()
                 Button { openSettings() } label: { Label("Settings", systemImage: "gearshape") }
                     .help("Settings")
-                Button(action: chooseFile) { Label("Add App", systemImage: "plus") }
-                    .help("Install an .ipa (⌘O)")
-                    .disabled(store.connection != .connected)
+                Menu {
+                    Button { chooseFile() } label: { Label("Choose .ipa File…", systemImage: "doc.zipper") }
+                    Button { openGitHubInstall() } label: { Label("Install from GitHub…", systemImage: "arrow.down.circle") }
+                } label: {
+                    Label("Add App", systemImage: "plus")
+                } primaryAction: {
+                    chooseFile()
+                }
+                .help("Install an .ipa (⌘O) or from GitHub (⇧⌘G)")
+                .disabled(store.connection != .connected)
             }
         }
         .sheet(item: $pending) { p in
-            InstallSheet(source: p.url).environment(store)
+            InstallSheet(source: p.url, github: p.github).environment(store)
+        }
+        .sheet(isPresented: $showGitHubInstall) {
+            GitHubInstallSheet { url, gh in
+                showGitHubInstall = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    openInstall(url, github: gh)
+                }
+            }
+            .environment(store)
         }
         .sheet(isPresented: $showSetup) {
             SetupSheet().environment(store)
@@ -90,6 +108,9 @@ struct ContentView: View {
         case "install":
             store.showOnboarding = false
             chooseFile()
+        case "install_github":
+            store.showOnboarding = false
+            openGitHubInstall()
         case "setup":
             store.showOnboarding = false
             showSetup = true
@@ -124,17 +145,32 @@ struct ContentView: View {
 
     /// Show the install sheet, closing whatever sheet is up first (SwiftUI
     /// drops a second sheet presented on the same view).
-    private func openInstall(_ url: URL) {
+    private func openInstall(_ url: URL, github: GitHubSource? = nil) {
         AppDelegate.startHidden = false
         guard anySheetOpen || store.showOnboarding else {
-            pending = PendingInstall(url: url)
+            pending = PendingInstall(url: url, github: github)
             return
         }
         pending = nil
+        showGitHubInstall = false
         showSetup = false
         detailAppId = nil
         store.showOnboarding = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { pending = PendingInstall(url: url) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { pending = PendingInstall(url: url, github: github) }
+    }
+
+    private func openGitHubInstall() {
+        AppDelegate.startHidden = false
+        guard anySheetOpen || store.showOnboarding else {
+            showGitHubInstall = true
+            return
+        }
+        pending = nil
+        showGitHubInstall = false
+        showSetup = false
+        detailAppId = nil
+        store.showOnboarding = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showGitHubInstall = true }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -178,6 +214,7 @@ private struct DropOverlay: View {
 struct HomeView: View {
     @Environment(Store.self) private var store
     let add: () -> Void
+    let addFromGitHub: () -> Void
     let openSetup: () -> Void
     let openApp: (AppRecord) -> Void
 
@@ -197,7 +234,7 @@ struct HomeView: View {
                 if store.account == nil {
                     SignInPanel()
                 } else if store.apps.isEmpty {
-                    EmptyLibrary(add: add)
+                    EmptyLibrary(add: add, addFromGitHub: addFromGitHub)
                 } else {
                     appsSection
                 }
@@ -249,7 +286,7 @@ struct HomeView: View {
                     AppCard(app: app, onOpen: { openApp(app) })
                 }
                 ForEach(0..<openSlots, id: \.self) { i in
-                    AddAppCard(add: add, emphasized: i == 0)
+                    AddAppCard(add: add, addFromGitHub: addFromGitHub, emphasized: i == 0)
                 }
             }
         }
@@ -413,8 +450,16 @@ struct AppCard: View {
         .animation(.easeOut(duration: 0.15), value: hover)
         .onHover { hover = $0 }
         .contextMenu {
+            if let rel = app.github?.availableRelease, app.onDevice != false {
+                Button("Update to \(rel.tag)") { Task { await store.updateRelease(app) } }
+                    .disabled(job != nil || !deviceConnected)
+            }
             Button(app.onDevice == false ? "Reinstall" : "Refresh Now") { Task { await store.refresh(app) } }
                 .disabled(job != nil || !deviceConnected)
+            if app.github != nil {
+                Button("Check for Updates") { Task { await store.checkUpdates(app: app) } }
+                    .disabled(job != nil)
+            }
             Toggle("Refresh Automatically", isOn: Binding(get: { app.options.autoRefresh }, set: { v in Task { await store.setAutoRefresh(app, v) } }))
             Divider()
             Button("Details…", action: onOpen)
@@ -423,17 +468,31 @@ struct AppCard: View {
     }
 
     private var refreshButton: some View {
-        Button { Task { await store.refresh(app) } } label: {
-            Image(systemName: app.onDevice == false ? "arrow.down" : "arrow.clockwise")
+        let avail = app.onDevice != false ? app.github?.availableRelease : nil
+        return Button {
+            Task {
+                if avail != nil {
+                    await store.updateRelease(app)
+                } else {
+                    await store.refresh(app)
+                }
+            }
+        } label: {
+            Image(systemName: avail != nil ? "arrow.down.circle.fill" : (app.onDevice == false ? "arrow.down" : "arrow.clockwise"))
                 .font(.callout.weight(.semibold))
+                .foregroundStyle(avail != nil ? Color.accentColor : Color.primary)
                 .frame(width: 30, height: 30)
-                .background(Circle().fill(Color.primary.opacity(hover ? 0.1 : 0.06)))
+                .background(Circle().fill(avail != nil ? Color.accentColor.opacity(hover ? 0.22 : 0.14) : Color.primary.opacity(hover ? 0.1 : 0.06)))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .disabled(job != nil || !deviceConnected)
         .opacity(job != nil || !deviceConnected ? 0.35 : 1)
-        .help(deviceConnected ? (app.onDevice == false ? "Reinstall" : "Refresh now (keeps app data)") : "Connect \(app.deviceName.isEmpty ? "the device" : app.deviceName) first")
+        .help(
+            !deviceConnected
+                ? "Connect \(app.deviceName.isEmpty ? "the device" : app.deviceName) first"
+                : avail.map { "Update to \($0.tag) (keeps app data)" } ?? (app.onDevice == false ? "Reinstall" : "Refresh now (keeps app data)")
+        )
     }
 
     @ViewBuilder private func status(_ expiry: Expiry) -> some View {
@@ -452,14 +511,19 @@ struct AppCard: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 7) {
-                HStack(alignment: .firstTextBaseline) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(expiry.text).font(.callout.weight(.semibold))
                         .foregroundStyle(expiry.color == .green ? Color.primary : (expiry.color == .yellow ? .orange : expiry.color))
                     Spacer()
-                    Text(app.options.autoRefresh ? "Auto" : "Manual")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(app.options.autoRefresh ? Color.green : Color.orange)
-                        .help(app.options.autoRefresh ? "Refreshed automatically before it expires" : "Auto-refresh is off for this app")
+                    if let rel = app.github?.availableRelease {
+                        Tag(text: "Update \(rel.tag)", color: .accentColor)
+                            .help("New release \(rel.tag) available on GitHub")
+                    } else {
+                        Text(app.options.autoRefresh ? "Auto" : "Manual")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(app.options.autoRefresh ? Color.green : Color.orange)
+                            .help(app.options.autoRefresh ? "Refreshed automatically before it expires" : "Auto-refresh is off for this app")
+                    }
                 }
                 ExpiryBar(expiry: expiry)
             }
@@ -469,55 +533,69 @@ struct AppCard: View {
 
 struct AddAppCard: View {
     let add: () -> Void
+    let addFromGitHub: () -> Void
     var emphasized = true
     @State private var hover = false
 
     var body: some View {
-        Button(action: add) {
-            VStack(spacing: 8) {
-                Image(systemName: "plus").font(.system(size: 22, weight: .medium))
-                    .frame(width: 44, height: 44)
-                    .background(Circle().fill(Color.accentColor.opacity(hover ? 0.2 : 0.12)))
-                    .foregroundStyle(.tint)
-                Text(emphasized ? "Add an app" : "Free slot").font(.callout.weight(.medium))
-                    .foregroundStyle(emphasized ? .primary : .secondary)
-                if emphasized {
-                    Text("Drop an .ipa or click").font(.caption).foregroundStyle(.secondary)
+        ZStack(alignment: .bottom) {
+            Button(action: add) {
+                VStack(spacing: 8) {
+                    Image(systemName: "plus").font(.system(size: 22, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .background(Circle().fill(Color.accentColor.opacity(hover ? 0.2 : 0.12)))
+                        .foregroundStyle(.tint)
+                    Text(emphasized ? "Add an app" : "Free slot").font(.callout.weight(.medium))
+                        .foregroundStyle(emphasized ? .primary : .secondary)
+                    if emphasized {
+                        Text("Drop an .ipa or click").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
+                .padding(.bottom, emphasized ? 22 : 0)
+                .frame(maxWidth: .infinity, minHeight: 170)
+                .background(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(hover ? 0.25 : 0.12), style: StrokeStyle(lineWidth: 1.5, dash: [6, 5]))
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
             }
-            .frame(maxWidth: .infinity, minHeight: 170)
-            .background(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(hover ? 0.25 : 0.12), style: StrokeStyle(lineWidth: 1.5, dash: [6, 5]))
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .buttonStyle(.plain)
+            .onHover { hover = $0 }
+
+            if emphasized {
+                Button("or from GitHub…", action: addFromGitHub)
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .padding(.bottom, 12)
+            }
         }
-        .buttonStyle(.plain)
-        .onHover { hover = $0 }
     }
 }
 
 struct EmptyLibrary: View {
     let add: () -> Void
+    let addFromGitHub: () -> Void
     var body: some View {
-        Button(action: add) {
-            VStack(spacing: 14) {
-                Image(systemName: "arrow.down.app")
-                    .font(.system(size: 46, weight: .light))
-                    .foregroundStyle(.tint)
-                Text("Install your first app").font(.title2.weight(.semibold))
-                Text("Drop an .ipa anywhere in this window, or click to choose one.\nLoadside signs it, installs it and keeps it fresh in the background.")
-                    .multilineTextAlignment(.center)
-                    .font(.callout).foregroundStyle(.secondary)
+        VStack(spacing: 14) {
+            Image(systemName: "arrow.down.app")
+                .font(.system(size: 46, weight: .light))
+                .foregroundStyle(.tint)
+            Text("Install your first app").font(.title2.weight(.semibold))
+            Text("Drop an .ipa anywhere in this window, or pick a GitHub repo.\nLoadside signs it, installs it, and keeps it up to date in the background.")
+                .multilineTextAlignment(.center)
+                .font(.callout).foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Button("Choose .ipa File…", action: add).primaryButton()
+                Button("Install from GitHub…", action: addFromGitHub).secondaryButton()
             }
-            .frame(maxWidth: .infinity, minHeight: 300)
-            .background(
-                RoundedRectangle(cornerRadius: 26, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.14), style: StrokeStyle(lineWidth: 1.5, dash: [8, 6]))
-            )
-            .contentShape(Rectangle())
+            .controlSize(.large)
+            .padding(.top, 4)
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, minHeight: 300)
+        .background(
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.14), style: StrokeStyle(lineWidth: 1.5, dash: [8, 6]))
+        )
     }
 }
 

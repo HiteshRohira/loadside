@@ -5,6 +5,7 @@
 //! Idles at a few MB of RAM; clients talk to it over a Unix socket.
 
 mod engine;
+mod github;
 mod logging;
 mod checklist;
 mod notify;
@@ -13,12 +14,13 @@ mod server;
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use futures::StreamExt;
-use loadside_core::{device, idevice::usbmuxd::UsbmuxdListenEvent, paths};
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use loadside_core::{
+    device::{self, WatchEvent},
+    paths,
+};
+use tracing::{debug, info, warn};
 
 fn main() -> anyhow::Result<()> {
     let foreground = std::env::args().any(|a| a == "--foreground" || a == "-f");
@@ -74,31 +76,8 @@ async fn run(logs: Arc<logging::LogBuffer>) -> anyhow::Result<()> {
 
     tokio::spawn(engine.clone().worker(jobs_rx));
     tokio::spawn(engine.clone().scheduler(check_rx));
-
-    // usbmuxd's listen stream isn't Send, so it lives on its own thread.
-    let (dev_tx, mut dev_rx) = mpsc::unbounded_channel::<WatchMsg>();
-    std::thread::Builder::new().name("usbmuxd-watch".into()).spawn(move || watch_thread(dev_tx))?;
-    let e2 = engine.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = dev_rx.recv().await {
-            match msg {
-                WatchMsg::Event(UsbmuxdListenEvent::Connected(d)) => {
-                    let e = e2.clone();
-                    tokio::spawn(async move { e.device_attached(d).await });
-                }
-                WatchMsg::Event(UsbmuxdListenEvent::Disconnected(id)) => e2.device_detached(id),
-                // Events may have been missed while disconnected: rebuild.
-                WatchMsg::Reconnected => {
-                    let e = e2.clone();
-                    tokio::spawn(async move {
-                        if let Err(fl) = e.refresh_devices().await {
-                            warn!("Device resync failed: {}", fl.message);
-                        }
-                    });
-                }
-            }
-        }
-    });
+    tokio::spawn(watch_usbmuxd(engine.clone()));
+    tokio::spawn(engine.clone().device_reconciler());
 
     let e3 = engine.clone();
     tokio::spawn(async move {
@@ -119,51 +98,56 @@ async fn run(logs: Arc<logging::LogBuffer>) -> anyhow::Result<()> {
     Ok(())
 }
 
-enum WatchMsg {
-    Event(UsbmuxdListenEvent),
-    Reconnected,
-}
+/// Continuously watch usbmuxd's v3 event stream (USB + Wi-Fi), reconciling
+/// device state after each successful handshake so missed events never stick.
+async fn watch_usbmuxd(engine: Arc<engine::Engine>) {
+    let mut backoff: u64 = 1;
+    loop {
+        match device::UsbmuxdListener::connect().await {
+            Ok(mut listener) => {
+                let connected_at = Instant::now();
+                info!("Connected to usbmuxd v3 event stream (USB + Wi-Fi)");
+                // Reconcile immediately after the handshake succeeds so any
+                // already-connected devices are picked up even if replay races.
+                let eng = engine.clone();
+                tokio::spawn(async move {
+                    if let Err(fl) = eng.reconcile_devices(false).await {
+                        warn!("Initial usbmuxd device sync failed: {}", fl.message);
+                    }
+                });
 
-fn watch_thread(tx: mpsc::UnboundedSender<WatchMsg>) {
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("device watcher runtime: {e}");
-            return;
-        }
-    };
-    rt.block_on(async move {
-        let mut backoff = 1;
-        let mut first = true;
-        loop {
-            if !first && tx.send(WatchMsg::Reconnected).is_err() {
-                return;
-            }
-            first = false;
-            match watch_once(&tx).await {
-                Ok(()) => backoff = 1,
-                Err(e) => {
-                    warn!("device watcher: {e:#} (retrying in {backoff}s)");
+                loop {
+                    match listener.next_event().await {
+                        Ok(Some(WatchEvent::Attached(dev))) => {
+                            debug!("usbmuxd Attached: {} (id {}, {})", dev.udid, dev.device_id, dev.connection);
+                            let eng = engine.clone();
+                            tokio::spawn(async move { eng.device_attached(dev).await });
+                        }
+                        Ok(Some(WatchEvent::Detached(id))) => {
+                            debug!("usbmuxd Detached: id {id}");
+                            engine.device_detached(id);
+                        }
+                        Ok(None) => {
+                            warn!("usbmuxd closed the event stream");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("usbmuxd event stream error: {e:#}");
+                            break;
+                        }
+                    }
+                }
+
+                // A healthy connection resets reconnect backoff instead of ratcheting to 30s forever.
+                if connected_at.elapsed() >= Duration::from_secs(10) {
+                    backoff = 1;
                 }
             }
-            if tx.is_closed() {
-                return;
+            Err(e) => {
+                warn!("usbmuxd watcher connect failed: {e:#} (retrying in {backoff}s)");
             }
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(30);
         }
-    });
-}
-
-async fn watch_once(tx: &mpsc::UnboundedSender<WatchMsg>) -> anyhow::Result<()> {
-    let mut mux = device::usbmuxd().await?;
-    let mut stream = mux.listen().await?;
-    // usbmuxd replays an Attached event for every device already connected.
-    while let Some(ev) = stream.next().await {
-        let ev = ev?;
-        if tx.send(WatchMsg::Event(ev)).is_err() {
-            return Ok(());
-        }
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
     }
-    anyhow::bail!("usbmuxd closed the listen connection")
 }

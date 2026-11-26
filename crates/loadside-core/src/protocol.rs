@@ -82,6 +82,9 @@ pub enum Event {
     Schedule { next_check_at: Option<i64> },
     /// Settings changed (from any client, the CLI included).
     Config { config: crate::config::Config },
+    /// Whether a GitHub token is saved in the Keychain changed.
+    #[serde(rename = "github_token")]
+    GitHubToken { configured: bool },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +102,7 @@ pub enum JobStatus {
 pub enum JobKind {
     Install,
     Refresh,
+    Update,
     Export,
     Login,
 }
@@ -155,6 +159,8 @@ pub struct Snapshot {
     pub prompts: Vec<Prompt>,
     pub config: crate::config::Config,
     pub next_check_at: Option<i64>,
+    #[serde(default)]
+    pub github_token_set: bool,
 }
 
 /// Parameters of the `install` method.
@@ -168,4 +174,7 @@ pub struct InstallParams {
     pub export_path: Option<String>,
     /// Set to false to only sign/export without installing.
     pub install: Option<bool>,
+    /// Optional GitHub release source to attach to the installed app record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<crate::state::GitHubSource>,
 }

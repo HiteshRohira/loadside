@@ -75,6 +75,110 @@ pub struct AccountInfo {
     pub is_free: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePolicy {
+    /// Download and install as soon as a new release is available.
+    Immediate,
+    /// Wait until the app's scheduled refresh, then update to the new release.
+    #[default]
+    OnRefresh,
+    /// Check and show when updates are available, but install only when asked.
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ReleaseAsset {
+    pub id: u64,
+    pub name: String,
+    pub download_url: String,
+    pub api_url: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ReleaseInfo {
+    pub release_id: u64,
+    pub tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub html_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub prerelease: bool,
+    pub asset: ReleaseAsset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GitHubSource {
+    /// Normalized "owner/repo".
+    pub repo: String,
+    /// Numeric GitHub repository ID pinned on connect/install to detect repo takeover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<u64>,
+    /// Optional substring or wildcard (`*`) filter when a release ships multiple `.ipa` files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_pattern: Option<String>,
+    /// Whether to track prerelease versions in addition to stable releases.
+    pub include_prereleases: bool,
+    /// When to install newly discovered releases.
+    pub policy: UpdatePolicy,
+    /// GitHub release ID of the version currently installed (if installed/updated from GitHub).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_release_id: Option<u64>,
+    /// GitHub tag of the version currently installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_tag: Option<String>,
+    /// Asset filename of the version currently installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_asset_name: Option<String>,
+    /// Newer release waiting to be installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_release: Option<ReleaseInfo>,
+    /// Last time GitHub was checked for this app (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<i64>,
+    /// HTTP ETag for conditional requests (304 responses don't consume rate limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// Error from the last GitHub release check, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_error: Option<crate::protocol::Failure>,
+    /// Last time an automatic GitHub update was attempted (for retry backoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_attempt_at: Option<i64>,
+    /// Consecutive non-transient failures during automatic GitHub updates.
+    pub consecutive_update_failures: u32,
+}
+
+impl Default for GitHubSource {
+    fn default() -> Self {
+        Self {
+            repo: String::new(),
+            repo_id: None,
+            asset_pattern: None,
+            include_prereleases: false,
+            policy: UpdatePolicy::OnRefresh,
+            installed_release_id: None,
+            installed_tag: None,
+            installed_asset_name: None,
+            available_release: None,
+            last_checked_at: None,
+            etag: None,
+            last_check_error: None,
+            last_update_attempt_at: None,
+            consecutive_update_failures: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppRecord {
@@ -100,6 +204,9 @@ pub struct AppRecord {
     pub consecutive_failures: u32,
     /// None = unknown, Some(false) = removed from the device by the user.
     pub on_device: Option<bool>,
+    /// Optional GitHub repository tracking for automatic release updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GitHubSource>,
 }
 
 impl Default for AppRecord {
@@ -123,6 +230,7 @@ impl Default for AppRecord {
             last_error: None,
             consecutive_failures: 0,
             on_device: None,
+            github: None,
         }
     }
 }

@@ -40,6 +40,10 @@ struct GeneralSettings: View {
     @Environment(Store.self) private var store
     @AppStorage(Prefs.menuBar) private var showMenuBar = true
     @State private var checking = false
+    @State private var checkingGitHub = false
+    @State private var githubCheckSummary: String?
+    @State private var githubTokenInput = ""
+    @State private var savingToken = false
     @State private var loginItemError: String?
 
     var body: some View {
@@ -78,6 +82,73 @@ struct GeneralSettings: View {
                 Section("Notifications") {
                     Toggle("Notify when apps refresh or fail", isOn: configBinding(store, \.notifications, "notifications"))
                 }
+                Section {
+                    let ghInterval = c.releaseCheckIntervalMinutes ?? 60
+                    Picker("Check for new releases", selection: Binding(
+                        get: { ghInterval },
+                        set: { v in Task { await store.setConfig(["release_check_interval_minutes": .number(Double(v))]) } }
+                    )) {
+                        ForEach(Array(Set([15, 30, 60, 120, 360, ghInterval])).sorted(), id: \.self) { m in
+                            Text(m % 60 == 0 ? (m == 60 ? "Every hour" : "Every \(m / 60) hours") : "Every \(m) minutes").tag(m)
+                        }
+                    }
+                    LabeledContent("Tracked apps") {
+                        HStack(spacing: 8) {
+                            let tracked = store.apps.filter { $0.github != nil }.count
+                            Text(githubCheckSummary ?? (tracked == 0 ? "None yet" : "\(tracked) app\(tracked == 1 ? "" : "s")"))
+                                .foregroundStyle(.secondary)
+                            Button(checkingGitHub ? "Checking…" : "Check Now") {
+                                Task {
+                                    checkingGitHub = true
+                                    if let r = await store.checkUpdates(force: true) {
+                                        let failed = r.failed ?? 0
+                                        if failed > 0 && r.updatesAvailable > 0 {
+                                            githubCheckSummary = "\(r.updatesAvailable) update\(r.updatesAvailable == 1 ? "" : "s"), \(failed) failed"
+                                        } else if failed > 0 {
+                                            githubCheckSummary = "\(failed) check\(failed == 1 ? "" : "s") failed"
+                                        } else if r.updatesAvailable > 0 {
+                                            githubCheckSummary = "\(r.updatesAvailable) update\(r.updatesAvailable == 1 ? "" : "s") available"
+                                        } else {
+                                            githubCheckSummary = "All up to date"
+                                        }
+                                    }
+                                    checkingGitHub = false
+                                }
+                            }
+                            .disabled(checkingGitHub || store.apps.allSatisfy { $0.github == nil })
+                        }
+                    }
+                    LabeledContent("GitHub token") {
+                        if store.githubTokenSet {
+                            HStack(spacing: 8) {
+                                Label("Saved in Keychain", systemImage: "checkmark.circle.fill")
+                                    .foregroundStyle(.green).font(.callout)
+                                Button("Remove") {
+                                    Task {
+                                        savingToken = true
+                                        await store.setGitHubToken(nil)
+                                        savingToken = false
+                                    }
+                                }
+                                .disabled(savingToken)
+                            }
+                        } else {
+                            HStack(spacing: 6) {
+                                SecureField("", text: $githubTokenInput, prompt: Text("Optional personal access token"))
+                                    .labelsHidden()
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 220)
+                                    .onSubmit { saveGitHubToken() }
+                                Button("Save", action: saveGitHubToken)
+                                    .disabled(githubTokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || savingToken)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("GitHub releases")
+                } footer: {
+                    Footnote("Each app chooses whether new GitHub releases install immediately, on the next refresh, or manually. A token is optional and only needed for private repositories or higher API rate limits.")
+                }
             }
             Section {
                 Toggle("Show Loadside in the menu bar", isOn: $showMenuBar)
@@ -95,6 +166,18 @@ struct GeneralSettings: View {
         .onChange(of: showMenuBar) { _, on in
             LoginItem.sync(enabled: on)
             loginItemError = LoginItem.lastError
+        }
+    }
+
+    private func saveGitHubToken() {
+        let tok = githubTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tok.isEmpty else { return }
+        Task {
+            savingToken = true
+            if await store.setGitHubToken(tok) {
+                githubTokenInput = ""
+            }
+            savingToken = false
         }
     }
 }

@@ -114,6 +114,9 @@ struct LoadsideApp: App {
                 Button("Install App…") { store.navigate = "install" }
                     .keyboardShortcut("o")
                     .disabled(store.connection != .connected)
+                Button("Install from GitHub…") { store.navigate = "install_github" }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(store.connection != .connected)
             }
             CommandGroup(after: .newItem) {
                 Button("Refresh All Apps") { Task { await store.refreshAll() } }

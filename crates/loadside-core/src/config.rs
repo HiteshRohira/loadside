@@ -17,6 +17,8 @@ pub struct Config {
     /// How often to check whether something needs refreshing (device
     /// connections also trigger a check immediately).
     pub check_interval_minutes: u32,
+    /// How often to check GitHub for new releases of tracked apps.
+    pub release_check_interval_minutes: u32,
     /// Name shown on the development certificate in your Apple account.
     pub machine_name: String,
     /// Show macOS notifications for background refreshes and failures.
@@ -42,6 +44,7 @@ impl Default for Config {
             auto_refresh: true,
             refresh_threshold_hours: 72,
             check_interval_minutes: 30,
+            release_check_interval_minutes: 60,
             machine_name: default_machine_name(),
             notifications: true,
             auto_revoke_own_certs: false,
@@ -131,6 +134,7 @@ impl Config {
     pub fn sanitized(mut self) -> Self {
         self.refresh_threshold_hours = self.refresh_threshold_hours.clamp(1, 24 * 6);
         self.check_interval_minutes = self.check_interval_minutes.clamp(5, 24 * 60);
+        self.release_check_interval_minutes = self.release_check_interval_minutes.clamp(15, 24 * 60);
         if self.anisette_url.trim().is_empty() {
             self.anisette_url = DEFAULT_ANISETTE_URL.to_string();
         }
