@@ -226,13 +226,61 @@ async fn dispatch(engine: &Arc<Engine>, method: &str, p: Value) -> Result<Value,
         }
         "refresh" => {
             let reinstall = p.get("reinstall").and_then(Value::as_bool).unwrap_or(false);
-            let id = engine.enqueue(JobSpec::Refresh { app_id: s(&p, "app_id")?.to_string(), reinstall }, false)?;
+            let skip_update = p.get("skip_update").and_then(Value::as_bool).unwrap_or(false);
+            let id = engine.enqueue(JobSpec::Refresh { app_id: s(&p, "app_id")?.to_string(), reinstall, skip_update }, false)?;
             Ok(json!({ "job_id": id }))
         }
-        "refresh_all" => Ok(json!({ "job_ids": engine.refresh_all() })),
+        "refresh_all" => Ok(json!({ "job_ids": engine.refresh_all().await })),
         "apps" => Ok(json!(engine.state.lock().unwrap().apps.clone())),
         "update_app" => engine.update_app(s(&p, "app_id")?, p.get("auto_refresh").and_then(Value::as_bool)),
         "remove_app" => engine.remove_app(s(&p, "app_id")?, p.get("uninstall").and_then(Value::as_bool).unwrap_or(false)).await,
+        "github_inspect" => {
+            let repo = s(&p, "repo")?;
+            let include_prereleases = p.get("include_prereleases").and_then(Value::as_bool).unwrap_or(false);
+            let asset_pattern = p.get("asset_pattern").and_then(Value::as_str);
+            engine.github_inspect(repo, include_prereleases, asset_pattern).await
+        }
+        "github_download" => {
+            let repo = s(&p, "repo")?;
+            let include_prereleases = p.get("include_prereleases").and_then(Value::as_bool).unwrap_or(false);
+            let asset_pattern = p.get("asset_pattern").and_then(Value::as_str);
+            let asset_name = p.get("asset_name").and_then(Value::as_str);
+            let release_id = p.get("release_id").and_then(Value::as_u64);
+            let asset_id = p.get("asset_id").and_then(Value::as_u64);
+            engine
+                .github_download(repo, include_prereleases, asset_pattern, asset_name, release_id, asset_id)
+                .await
+        }
+        "set_app_github" => {
+            let app_id = s(&p, "app_id")?;
+            let disconnect = p.get("disconnect").and_then(Value::as_bool).unwrap_or(false);
+            let repo = p.get("repo").and_then(Value::as_str);
+            let policy = match p.get("policy") {
+                Some(v) if !v.is_null() => Some(
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| Failure::new("bad_request", format!("invalid update policy: {e}")))?,
+                ),
+                _ => None,
+            };
+            let include_prereleases = p.get("include_prereleases").and_then(Value::as_bool);
+            let asset_pattern = p.get("asset_pattern").map(|v| v.as_str().map(str::to_string));
+            engine
+                .set_app_github(app_id, disconnect, repo, policy, include_prereleases, asset_pattern)
+                .await
+        }
+        "check_updates" => {
+            let app_id = p.get("app_id").and_then(Value::as_str);
+            let force = p.get("force").and_then(Value::as_bool).unwrap_or(true);
+            engine.check_updates(app_id, force).await
+        }
+        "update_release" => {
+            let id = engine.enqueue(JobSpec::Update { app_id: s(&p, "app_id")?.to_string() }, false)?;
+            Ok(json!({ "job_id": id }))
+        }
+        "set_github_token" => {
+            let token = p.get("token").and_then(Value::as_str).map(str::to_string);
+            engine.set_github_token(token).await
+        }
         "app_ids" => engine.app_ids().await,
         "delete_app_id" => engine.delete_app_id(s(&p, "app_id_id")?).await,
         "certs" => engine.certs().await,

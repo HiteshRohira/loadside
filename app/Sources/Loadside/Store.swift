@@ -18,6 +18,7 @@ final class Store {
     var prompts: [Prompt] = []
     var config: DaemonConfig?
     var nextCheckAt: Int?
+    var githubTokenSet = false
     var logs: [LogLine] = []
     var banner: Banner?
 
@@ -51,6 +52,8 @@ final class Store {
     private let client = DaemonClient()
     private var reconnectTask: Task<Void, Never>?
     private var triedInstallingAgent = false
+    private var lastAutoDeviceRefresh: Date = .distantPast
+    private var lifecycleObservers: [NSObjectProtocol] = []
 
     init() {
         clockTask = Task { [weak self] in
@@ -61,6 +64,16 @@ final class Store {
         }
         client.onEvent = { [weak self] ev in Task { @MainActor in self?.apply(event: ev) } }
         client.onDisconnect = { [weak self] in Task { @MainActor in self?.disconnected() } }
+        lifecycleObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in await self?.refreshDevicesIfStale(minInterval: 5) }
+            }
+        )
+        lifecycleObservers.append(
+            NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in await self?.refreshDevicesIfStale(minInterval: 15) }
+            }
+        )
         start()
     }
 
@@ -365,6 +378,7 @@ final class Store {
         }
         config = s.config
         nextCheckAt = s.nextCheckAt
+        githubTokenSet = s.githubTokenSet ?? false
     }
 
     private func apply(event ev: JSON) {
@@ -372,7 +386,7 @@ final class Store {
         case "job":
             guard let j = try? ev["job"]?.decode(JobInfo.self) else { return }
             if let i = jobs.firstIndex(where: { $0.id == j.id }) { jobs[i] = j } else { jobs.append(j) }
-            if j.status == .succeeded, j.kind == .install || j.kind == .refresh {
+            if j.status == .succeeded, j.kind == .install || j.kind == .refresh || j.kind == .update {
                 // Account quotas changed.
                 appIds = nil
                 if account?.isFree == true { Task { await loadAppIds() } }
@@ -418,6 +432,8 @@ final class Store {
             nextCheckAt = ev["next_check_at"]?.int ?? ev["nextCheckAt"]?.int
         case "config":
             if let c = try? ev["config"]?.decode(DaemonConfig.self) { config = c }
+        case "github_token", "git_hub_token":
+            githubTokenSet = ev["configured"]?.bool ?? false
         case "notice":
             banner = Banner(title: ev["title"]?.string ?? "", message: ev["message"]?.string ?? "", isError: ev["level"]?.string == "error")
         default: break
@@ -508,10 +524,10 @@ final class Store {
         try await client.call("install", try JSON.from(params), as: JobRef.self).jobId
     }
 
-    func refresh(_ app: AppRecord) async {
+    func refresh(_ app: AppRecord, skipUpdate: Bool = false) async {
         // A deleted app gets reinstalled; otherwise this is a normal refresh.
         let reinstall = app.onDevice == false
-        await run { _ = try await client.call("refresh", .object(["app_id": .string(app.id), "reinstall": .bool(reinstall)])) }
+        await run { _ = try await client.call("refresh", .object(["app_id": .string(app.id), "reinstall": .bool(reinstall), "skip_update": .bool(skipUpdate)])) }
     }
 
     func refreshAll() async { await run { _ = try await client.call("refresh_all") } }
@@ -525,7 +541,16 @@ final class Store {
     }
 
     func refreshDevices() async {
+        lastAutoDeviceRefresh = Date()
         if let d = await run({ try await client.call("devices", .object(["refresh": .bool(true)]), as: [DeviceInfo].self) }) { devices = d }
+    }
+
+    func refreshDevicesIfStale(minInterval: TimeInterval = 15) async {
+        guard connection == .connected, Date().timeIntervalSince(lastAutoDeviceRefresh) >= minInterval else { return }
+        lastAutoDeviceRefresh = Date()
+        if let d = try? await client.call("devices", .object(["refresh": .bool(true)]), as: [DeviceInfo].self) {
+            devices = d
+        }
     }
 
     func cancel(_ job: JobInfo) async { await run { _ = try await client.call("cancel_job", .object(["job_id": .string(job.id)])) } }
@@ -551,6 +576,98 @@ final class Store {
     }
 
     func checkNow() async { await run { _ = try await client.call("check_now") } }
+
+    // MARK: GitHub release tracking
+
+    func githubInspect(repo: String, includePrereleases: Bool = false, assetPattern: String? = nil) async throws -> GitHubInspectResult {
+        var params: [String: JSON] = [
+            "repo": .string(repo),
+            "include_prereleases": .bool(includePrereleases),
+        ]
+        if let assetPattern, !assetPattern.isEmpty {
+            params["asset_pattern"] = .string(assetPattern)
+        }
+        return try await client.call("github_inspect", .object(params), as: GitHubInspectResult.self)
+    }
+
+    func githubDownload(
+        repo: String,
+        includePrereleases: Bool = false,
+        assetPattern: String? = nil,
+        assetName: String? = nil,
+        releaseId: UInt64? = nil,
+        assetId: UInt64? = nil
+    ) async throws -> GitHubDownloadResult {
+        var params: [String: JSON] = [
+            "repo": .string(repo),
+            "include_prereleases": .bool(includePrereleases),
+        ]
+        if let assetPattern, !assetPattern.isEmpty {
+            params["asset_pattern"] = .string(assetPattern)
+        }
+        if let assetName, !assetName.isEmpty {
+            params["asset_name"] = .string(assetName)
+        }
+        if let releaseId { params["release_id"] = .number(Double(releaseId)) }
+        if let assetId { params["asset_id"] = .number(Double(assetId)) }
+        return try await client.call("github_download", .object(params), as: GitHubDownloadResult.self)
+    }
+
+    func setAppGitHubThrowing(
+        _ app: AppRecord,
+        disconnect: Bool = false,
+        repo: String? = nil,
+        policy: UpdatePolicy? = nil,
+        includePrereleases: Bool? = nil,
+        assetPattern: String?? = nil
+    ) async throws {
+        var params: [String: JSON] = ["app_id": .string(app.id), "disconnect": .bool(disconnect)]
+        if let repo { params["repo"] = .string(repo) }
+        if let policy { params["policy"] = .string(policy.rawValue) }
+        if let includePrereleases { params["include_prereleases"] = .bool(includePrereleases) }
+        if let assetPattern {
+            params["asset_pattern"] = assetPattern.map(JSON.string) ?? .null
+        }
+        _ = try await client.call("set_app_github", .object(params))
+    }
+
+    @discardableResult
+    func setAppGitHub(
+        _ app: AppRecord,
+        disconnect: Bool = false,
+        repo: String? = nil,
+        policy: UpdatePolicy? = nil,
+        includePrereleases: Bool? = nil,
+        assetPattern: String?? = nil
+    ) async -> Bool {
+        await run {
+            try await setAppGitHubThrowing(
+                app,
+                disconnect: disconnect,
+                repo: repo,
+                policy: policy,
+                includePrereleases: includePrereleases,
+                assetPattern: assetPattern
+            )
+        } != nil
+    }
+
+    @discardableResult
+    func checkUpdates(app: AppRecord? = nil, force: Bool = true) async -> CheckUpdatesResult? {
+        var params: [String: JSON] = ["force": .bool(force)]
+        if let app { params["app_id"] = .string(app.id) }
+        return await run { try await client.call("check_updates", .object(params), as: CheckUpdatesResult.self) }
+    }
+
+    func updateRelease(_ app: AppRecord) async {
+        await run { _ = try await client.call("update_release", .object(["app_id": .string(app.id)])) }
+    }
+
+    @discardableResult
+    func setGitHubToken(_ token: String?) async -> Bool {
+        let val: JSON = token.map(JSON.string) ?? .null
+        return await run { _ = try await client.call("set_github_token", .object(["token": val])) } != nil
+    }
 
     // MARK: Setup
 

@@ -1,17 +1,17 @@
 //! The daemon's brain: state, Apple session, job queue, device tracking and
 //! the auto-refresh scheduler.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use loadside_core::{
     account::{self, CertSummary, Session, TwoFactorCallbackParams, TwoFactorCallbackResponse},
     config::Config,
-    device::{self, DeviceInfo},
+    device::{self, AttachedDevice, DeviceInfo},
     errors, ipa, paths,
     pipeline::{self, CertChooser},
     protocol::{Event, Failure, InstallParams, JobInfo, JobKind, JobStatus, Snapshot},
@@ -37,7 +37,10 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 pub enum JobSpec {
     Install(InstallParams),
     /// `reinstall`: the user asked to put a deleted app back.
-    Refresh { app_id: String, reinstall: bool },
+    /// `skip_update`: re-sign the current version even if a GitHub update is waiting.
+    Refresh { app_id: String, reinstall: bool, skip_update: bool },
+    /// Download and install the latest GitHub release for a tracked app.
+    Update { app_id: String },
 }
 
 #[derive(Debug)]
@@ -45,6 +48,30 @@ pub struct QueuedJob {
     pub id: String,
     pub spec: JobSpec,
     pub background: bool,
+}
+
+#[derive(Default)]
+struct DeviceRegistry {
+    devices: BTreeMap<String, DeviceInfo>,
+    /// usbmuxd device id -> (udid, "usb" | "wifi")
+    mux: HashMap<u32, (String, String)>,
+    /// Last time we probed lockdown for a UDID (used to auto-retry locked devices).
+    last_probe: HashMap<String, Instant>,
+}
+
+impl DeviceRegistry {
+    fn effective_connection(&self, udid: &str) -> Option<String> {
+        let mut saw_wifi = false;
+        for (u, c) in self.mux.values() {
+            if u == udid {
+                if c == "usb" {
+                    return Some("usb".into());
+                }
+                saw_wifi = true;
+            }
+        }
+        saw_wifi.then(|| "wifi".into())
+    }
 }
 
 pub struct Engine {
@@ -60,11 +87,13 @@ pub struct Engine {
     /// Apps being removed: no new jobs for them until that's done.
     removing: Mutex<std::collections::HashSet<String>>,
     queue: mpsc::UnboundedSender<QueuedJob>,
-    devices: Mutex<BTreeMap<String, DeviceInfo>>,
-    /// usbmuxd device id → (udid, connection)
-    mux: Mutex<HashMap<u32, (String, String)>>,
+    device_registry: Mutex<DeviceRegistry>,
+    /// Serializes device reconciliations so concurrent refreshes don't pile up.
+    reconcile_lock: tokio::sync::Mutex<()>,
+    /// App ID -> timestamp of last "unlock your iPhone to refresh" notification.
+    expiry_reminded: Mutex<HashMap<String, i64>>,
     pub logs: Arc<LogBuffer>,
-    check_tx: mpsc::UnboundedSender<()>,
+    pub(crate) check_tx: mpsc::UnboundedSender<()>,
     next_check_at: AtomicI64,
     /// Serializes state.json writes so an older snapshot never wins.
     save_lock: Mutex<()>,
@@ -73,7 +102,11 @@ pub struct Engine {
     /// A background sign-in needed 2FA (or was rejected). Don't keep trying
     /// unattended (each try can send a code to the user's devices) until the
     /// user signs in from the app.
-    needs_interactive_login: AtomicBool,
+    pub(crate) needs_interactive_login: AtomicBool,
+    /// Serializes GitHub release checks so manual + scheduled checks don't race.
+    pub(crate) github_check_lock: tokio::sync::Mutex<()>,
+    /// Cached flag for whether a GitHub token exists in the Keychain.
+    pub(crate) github_token_cached: Mutex<Option<bool>>,
 }
 
 fn f(code: &str, msg: &str) -> Failure {
@@ -88,7 +121,7 @@ fn uuid_v4() -> String {
     loadside_core::pipeline::new_id()
 }
 
-fn fmt_date(ts: i64) -> String {
+pub(crate) fn fmt_date(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.with_timezone(&chrono::Local).format("%a %b %-d, %H:%M").to_string())
         .unwrap_or_default()
@@ -112,14 +145,17 @@ impl Engine {
             removing: Mutex::default(),
             job_inputs: Mutex::default(),
             queue,
-            devices: Mutex::default(),
-            mux: Mutex::default(),
+            device_registry: Mutex::default(),
+            reconcile_lock: tokio::sync::Mutex::new(()),
+            expiry_reminded: Mutex::default(),
             logs,
             check_tx,
             next_check_at: AtomicI64::new(0),
             save_lock: Mutex::new(()),
             logged_in: AtomicBool::new(false),
             needs_interactive_login: AtomicBool::new(false),
+            github_check_lock: tokio::sync::Mutex::new(()),
+            github_token_cached: Mutex::new(None),
         });
         Ok((engine, qrx, crx))
     }
@@ -161,18 +197,38 @@ impl Engine {
         self.emit(Event::Account { account, logged_in });
     }
 
-    fn notify(&self, title: &str, msg: &str) {
+    pub(crate) fn notify(&self, title: &str, msg: &str) {
         if self.config().notifications {
             notify::send(title, msg);
         }
     }
 
     pub fn devices(&self) -> Vec<DeviceInfo> {
-        self.devices.lock().unwrap().values().cloned().collect()
+        self.device_registry.lock().unwrap().devices.values().cloned().collect()
     }
 
     pub(crate) fn device_connected(&self, udid: &str) -> bool {
-        self.devices.lock().unwrap().contains_key(udid)
+        let reg = self.device_registry.lock().unwrap();
+        reg.devices.contains_key(udid) || reg.mux.values().any(|(u, _)| u == udid)
+    }
+
+    /// True when the device is connected AND lockdown pairing succeeded (not locked/untrusted).
+    pub(crate) fn device_usable(&self, udid: &str) -> bool {
+        self.device_registry
+            .lock()
+            .unwrap()
+            .devices
+            .get(udid)
+            .is_some_and(|d| d.paired)
+    }
+
+    /// Check cache first; if missing, run a fast live usbmuxd reconciliation before saying no.
+    pub(crate) async fn ensure_device_connected(self: &Arc<Self>, udid: &str) -> bool {
+        if self.device_connected(udid) {
+            return true;
+        }
+        let _ = self.reconcile_devices(false).await;
+        self.device_connected(udid)
     }
 
     pub(crate) fn has_session(&self) -> bool {
@@ -183,6 +239,7 @@ impl Engine {
         let logged_in = self.has_session();
         let st = self.state.lock().unwrap().clone();
         let next = self.next_check_at.load(Ordering::Relaxed);
+        let github_token_set = self.github_token_configured().await;
         Snapshot {
             version: loadside_core::VERSION.into(),
             pid: std::process::id(),
@@ -195,6 +252,7 @@ impl Engine {
             prompts: self.prompts.open(),
             config: self.config(),
             next_check_at: (next > 0).then_some(next),
+            github_token_set,
         }
     }
 
@@ -328,7 +386,7 @@ impl Engine {
     /// Get a usable session, signing in again with the saved password if
     /// needed. `allow_prompt` = a human started this and can answer a 2FA
     /// prompt; background work never prompts.
-    async fn session(self: &Arc<Self>, force_relogin: bool, allow_prompt: bool) -> Result<Session, Failure> {
+    pub(crate) async fn session(self: &Arc<Self>, force_relogin: bool, allow_prompt: bool) -> Result<Session, Failure> {
         let mut guard = self.session.lock().await;
         if let Some(s) = guard.as_ref() {
             if !force_relogin && !s.is_stale() {
@@ -515,7 +573,7 @@ impl Engine {
     // Jobs
     // ------------------------------------------------------------------
 
-    fn update_job(&self, id: &str, upd: impl FnOnce(&mut JobInfo)) {
+    pub(crate) fn update_job(&self, id: &str, upd: impl FnOnce(&mut JobInfo)) {
         let job = {
             let mut jobs = self.jobs.lock().unwrap();
             let Some(j) = jobs.iter_mut().find(|j| j.id == id) else { return };
@@ -543,11 +601,22 @@ impl Engine {
                 let verb = if install { "Install" } else { "Export" };
                 (kind, format!("{verb} {name}"), None, p.device_udid.clone())
             }
-            JobSpec::Refresh { app_id, reinstall } => {
+            JobSpec::Refresh { app_id, reinstall, .. } => {
                 let st = self.state.lock().unwrap();
                 let app = st.app(app_id).ok_or_else(|| f("not_found", "Unknown app."))?;
                 let verb = if *reinstall { "Reinstall" } else { "Refresh" };
                 (JobKind::Refresh, format!("{verb} {}", app.name), Some(app_id.clone()), Some(app.device_udid.clone()))
+            }
+            JobSpec::Update { app_id } => {
+                let st = self.state.lock().unwrap();
+                let app = st.app(app_id).ok_or_else(|| f("not_found", "Unknown app."))?;
+                let gh = app.github.as_ref().ok_or_else(|| f("no_github", "This app isn't connected to a GitHub repository."))?;
+                let tag = gh
+                    .available_release
+                    .as_ref()
+                    .map(|r| format!(" to {}", r.tag))
+                    .unwrap_or_default();
+                (JobKind::Update, format!("Update {}{tag}", app.name), Some(app_id.clone()), Some(app.device_udid.clone()))
             }
         };
         let job = JobInfo {
@@ -646,7 +715,8 @@ impl Engine {
             let handle = tokio::spawn(async move {
                 match &spec {
                     JobSpec::Install(p) => engine.run_install(&id, p, background).await,
-                    JobSpec::Refresh { app_id, reinstall } => engine.run_refresh(&id, app_id, background, *reinstall).await,
+                    JobSpec::Refresh { app_id, reinstall, skip_update } => engine.run_refresh(&id, app_id, background, *reinstall, *skip_update).await,
+                    JobSpec::Update { app_id } => engine.run_update(&id, app_id, background).await,
                 }
             });
             let result = handle.await.unwrap_or_else(|e| {
@@ -678,21 +748,26 @@ impl Engine {
         }
     }
 
-    fn progress_for(self: &Arc<Self>, job_id: &str) -> pipeline::Progress {
+    pub(crate) fn progress_for(self: &Arc<Self>, job_id: &str) -> pipeline::Progress {
+        self.scaled_progress_for(job_id, 0.0, 1.0)
+    }
+
+    pub(crate) fn scaled_progress_for(self: &Arc<Self>, job_id: &str, start: f32, end: f32) -> pipeline::Progress {
         let engine = self.clone();
         let id = job_id.to_string();
         let last = Arc::new(Mutex::new((String::new(), -1.0f32)));
         Arc::new(move |stage: &str, p: f32| {
+            let scaled = (start + p.clamp(0.0, 1.0) * (end - start)).clamp(0.0, 1.0);
             {
                 let mut l = last.lock().unwrap();
-                if l.0 == stage && (p - l.1).abs() < 0.01 {
+                if l.0 == stage && (scaled - l.1).abs() < 0.01 {
                     return;
                 }
-                *l = (stage.to_string(), p);
+                *l = (stage.to_string(), scaled);
             }
             engine.update_job(&id, |j| {
                 j.stage = stage.to_string();
-                j.progress = p.clamp(0.0, 1.0);
+                j.progress = scaled;
             });
         })
     }
@@ -729,10 +804,19 @@ impl Engine {
     }
 
     /// Run the pipeline, re-authenticating and retrying once if the session expired.
-    async fn sign_with_retry<'r>(
+    pub(crate) async fn sign_with_retry<'r>(
         self: &Arc<Self>,
         req: impl Fn() -> pipeline::Request<'r>,
         job_id: &str,
+        background: bool,
+    ) -> Result<pipeline::Outcome, Failure> {
+        self.sign_with_retry_progress(req, self.progress_for(job_id), background).await
+    }
+
+    pub(crate) async fn sign_with_retry_progress<'r>(
+        self: &Arc<Self>,
+        req: impl Fn() -> pipeline::Request<'r>,
+        progress: pipeline::Progress,
         background: bool,
     ) -> Result<pipeline::Outcome, Failure> {
         let config = self.config();
@@ -743,7 +827,7 @@ impl Engine {
             // job queue (and everything waiting behind it) forever.
             let res = match tokio::time::timeout(
                 JOB_TIMEOUT,
-                pipeline::run(&mut session, &config, req(), self.progress_for(job_id), self.cert_chooser(background)),
+                pipeline::run(&mut session, &config, req(), progress.clone(), self.cert_chooser(background)),
             )
             .await
             {
@@ -770,15 +854,19 @@ impl Engine {
         unreachable!()
     }
 
-    fn pick_device(&self, wanted: Option<&str>) -> Result<String, Failure> {
+    async fn pick_device(self: &Arc<Self>, wanted: Option<&str>) -> Result<String, Failure> {
         if let Some(u) = wanted.filter(|u| !u.is_empty()) {
-            if !self.device_connected(u) {
+            if !self.ensure_device_connected(u).await {
                 return Err(f("device_not_found", "The selected device isn't connected.")
                     .with_hint(crate::checklist::NOT_CONNECTED_HINT));
             }
             return Ok(u.to_string());
         }
-        let devs = self.devices();
+        let mut devs = self.devices();
+        if devs.is_empty() {
+            let _ = self.reconcile_devices(false).await;
+            devs = self.devices();
+        }
         match devs.as_slice() {
             [one] => Ok(one.udid.clone()),
             [] => {
@@ -823,7 +911,7 @@ impl Engine {
         }
     }
 
-    fn library_copy(&self, src: &Path, record_id: &str) -> Result<PathBuf> {
+    pub(crate) fn library_copy(&self, src: &Path, record_id: &str) -> Result<PathBuf> {
         let lib = paths::library_dir();
         std::fs::create_dir_all(&lib)?;
         let dest = if src.is_dir() { lib.join(format!("{record_id}.app")) } else { lib.join(format!("{record_id}.ipa")) };
@@ -896,7 +984,7 @@ impl Engine {
         }
         let install = p.install.unwrap_or(true);
         let udid = if install {
-            Some(self.pick_device(p.device_udid.as_deref())?)
+            Some(self.pick_device(p.device_udid.as_deref()).await?)
         } else {
             p.device_udid.clone().filter(|u| !u.is_empty() && self.device_connected(u))
         };
@@ -997,6 +1085,40 @@ impl Engine {
         };
         {
             let mut st = self.state.lock().unwrap();
+            let existing_prev = st.app(&record_id).cloned();
+            let github = match p.github.clone() {
+                Some(mut gh) => {
+                    // Only stamp last_checked_at if this install actually came from a fetched release.
+                    if gh.installed_release_id.is_some() {
+                        gh.last_checked_at = gh.last_checked_at.or(Some(now));
+                    }
+                    gh.available_release = None;
+                    gh.last_check_error = None;
+                    gh.consecutive_update_failures = 0;
+                    gh.last_update_attempt_at = None;
+                    Some(gh)
+                }
+                None => existing_prev.and_then(|prev| {
+                    let mut gh = prev.github?;
+                    // User installed a local IPA over an already-tracked app: keep the GitHub
+                    // connection, clear ETag so the next check reconciles cleanly, and clear
+                    // stale installed release IDs if the version changed.
+                    gh.etag = None;
+                    if prev.version != outcome.version {
+                        gh.installed_release_id = None;
+                        gh.installed_tag = None;
+                        gh.installed_asset_name = None;
+                    }
+                    if let Some(avail) = &gh.available_release {
+                        if !loadside_core::github::is_newer_release(None, None, outcome.version.as_deref(), avail) {
+                            gh.installed_release_id = Some(avail.release_id);
+                            gh.installed_tag = Some(avail.tag.clone());
+                            gh.available_release = None;
+                        }
+                    }
+                    Some(gh)
+                }),
+            };
             let rec = AppRecord {
                 id: record_id.clone(),
                 name: outcome.name.clone(),
@@ -1017,6 +1139,7 @@ impl Engine {
                 last_error: None,
                 consecutive_failures: 0,
                 on_device: Some(true),
+                github,
             };
             match st.app_mut(&record_id) {
                 Some(r) => *r = AppRecord { installed_at: r.installed_at, ..rec },
@@ -1033,7 +1156,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn run_refresh(self: &Arc<Self>, job_id: &str, app_id: &str, background: bool, reinstall: bool) -> Result<(), Failure> {
+    async fn run_refresh(self: &Arc<Self>, job_id: &str, app_id: &str, background: bool, reinstall: bool, skip_update: bool) -> Result<(), Failure> {
         let rec = self.state.lock().unwrap().app(app_id).cloned().ok_or_else(|| f("not_found", "Unknown app."))?;
         let now = loadside_core::now();
         self.mutate_app(app_id, |a| a.last_attempt_at = Some(now));
@@ -1054,13 +1177,18 @@ impl Engine {
                         )));
                 }
             }
-            if !rec.source_path.exists() {
-                return Err(f("source_missing", "The original IPA for this app is gone.")
-                    .with_hint("Install it again from an IPA file (Install → choose file)."));
-            }
-            if !self.device_connected(&rec.device_udid) {
+            if !self.ensure_device_connected(&rec.device_udid).await {
                 return Err(f("device_not_found", format!("{} isn't connected.", if rec.device_name.is_empty() { "The device" } else { &rec.device_name }).as_str())
                     .with_hint(crate::checklist::NOT_CONNECTED_HINT));
+            }
+            let can_fetch_github = !reinstall
+                && !skip_update
+                && rec.github.as_ref().is_some_and(|g| {
+                    matches!(g.policy, loadside_core::state::UpdatePolicy::OnRefresh | loadside_core::state::UpdatePolicy::Immediate)
+                });
+            if !rec.source_path.exists() && !can_fetch_github {
+                return Err(f("source_missing", "The original IPA for this app is gone.")
+                    .with_hint("Install it again from an IPA file (Install → choose file)."));
             }
             self.progress_for(job_id)("Checking device", 0.01);
             // Unattended refreshes must not resurrect an app the user deleted;
@@ -1092,49 +1220,194 @@ impl Engine {
                     _ => {}
                 }
             }
+            // If this app tracks GitHub releases with "on refresh" (or "immediate"),
+            // check for and pull the new release IPA right now so refreshing also
+            // updates it in one go. If GitHub download, validation, or signing fails,
+            // fall back to the local library IPA so the app never expires.
+            let mut fetched_release: Option<(loadside_core::state::ReleaseInfo, crate::github::TempDownload, crate::github::StagedLibraryFile)> = None;
+            let mut extra_warnings: Vec<String> = Vec::new();
+            if !reinstall && !skip_update {
+                if let Some((rel, dl_res)) = self.maybe_fetch_release_for_refresh(job_id, &rec, background).await {
+                    match dl_res {
+                        Ok((tmp, staged_lib)) => fetched_release = Some((rel, tmp, staged_lib)),
+                        Err(fl) => {
+                            if rec.source_path.exists() {
+                                let w = format!(
+                                    "Couldn't fetch {} from GitHub ({}); refreshed the installed version instead.",
+                                    rel.tag, fl.message
+                                );
+                                warn!("{w}");
+                                extra_warnings.push(w);
+                                let now_ts = loadside_core::now();
+                                let transient = matches!(fl.code.as_str(), "network" | "github_rate_limit");
+                                self.mutate_app(app_id, |a| {
+                                    if let Some(g) = a.github.as_mut() {
+                                        g.last_check_error = Some(Failure { detail: None, ..fl.clone() });
+                                        g.last_update_attempt_at = Some(now_ts);
+                                        if !transient {
+                                            g.consecutive_update_failures += 1;
+                                        }
+                                    }
+                                });
+                            } else {
+                                return Err(fl);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if fetched_release.is_none() && !rec.source_path.exists() {
+                return Err(f("source_missing", "The original IPA for this app is gone.")
+                    .with_hint("Install it again from an IPA file (Install → choose file)."));
+            }
             let target = self.target(&rec.device_udid);
-            self.sign_with_retry(
-                || pipeline::Request {
-                    source: &rec.source_path,
-                    options: &rec.options,
-                    device: Some(&target),
-                    export_to: None,
-                    install: true,
-                    expect_bundle_id: Some(&rec.bundle_id),
-                },
-                job_id,
-                background,
-            )
-            .await
+            let outcome = if let Some((ref rel, ref tmp, _)) = fetched_release {
+                let source_to_sign = tmp.path().to_path_buf();
+                let res = self
+                    .sign_with_retry_progress(
+                        || pipeline::Request {
+                            source: &source_to_sign,
+                            options: &rec.options,
+                            device: Some(&target),
+                            export_to: None,
+                            install: true,
+                            expect_bundle_id: Some(&rec.bundle_id),
+                        },
+                        self.scaled_progress_for(job_id, 0.28, 1.0),
+                        background,
+                    )
+                    .await;
+                match res {
+                    Ok(o) => o,
+                    Err(fl) if rec.source_path.exists() && !matches!(fl.code.as_str(), "device_not_found" | "device_locked" | "needs_2fa" | "needs_login" | "team_mismatch") => {
+                        let w = format!(
+                            "Couldn't install {} from GitHub ({}); refreshed the installed version instead.",
+                            rel.tag, fl.message
+                        );
+                        warn!("{w}");
+                        extra_warnings.push(w);
+                        let now_ts = loadside_core::now();
+                        self.mutate_app(app_id, |a| {
+                            if let Some(g) = a.github.as_mut() {
+                                g.last_check_error = Some(Failure { detail: None, ..fl.clone() });
+                                g.last_update_attempt_at = Some(now_ts);
+                                g.consecutive_update_failures += 1;
+                            }
+                        });
+                        fetched_release = None;
+                        self.sign_with_retry_progress(
+                            || pipeline::Request {
+                                source: &rec.source_path,
+                                options: &rec.options,
+                                device: Some(&target),
+                                export_to: None,
+                                install: true,
+                                expect_bundle_id: Some(&rec.bundle_id),
+                            },
+                            self.progress_for(job_id),
+                            background,
+                        )
+                        .await?
+                    }
+                    Err(fl) => return Err(fl),
+                }
+            } else {
+                self.sign_with_retry_progress(
+                    || pipeline::Request {
+                        source: &rec.source_path,
+                        options: &rec.options,
+                        device: Some(&target),
+                        export_to: None,
+                        install: true,
+                        expect_bundle_id: Some(&rec.bundle_id),
+                    },
+                    self.progress_for(job_id),
+                    background,
+                )
+                .await?
+            };
+            Ok((outcome, fetched_release, extra_warnings))
         }
         .await;
 
         match result {
-            Ok(outcome) => {
+            Ok((outcome, fetched_release, mut extra_warnings)) => {
                 let now = loadside_core::now();
+                let mut updated_tag: Option<String> = None;
+                let expected_repo = rec.github.as_ref().map(|g| g.repo.clone());
+                let (applied_release, new_source_path) = if let Some((rel, _tmp, staged_lib)) = fetched_release {
+                    let committed = tokio::task::spawn_blocking(move || staged_lib.commit())
+                        .await
+                        .ok()
+                        .and_then(|r| match r {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                warn!("Updated {} on device, but couldn't finalize library IPA: {e:#}", rec.name);
+                                None
+                            }
+                        });
+                    if committed.is_some() {
+                        updated_tag = Some(rel.tag.clone());
+                    } else {
+                        extra_warnings.push("Updated on the device, but couldn't update Loadside's local library copy.".into());
+                    }
+                    (Some(rel), committed)
+                } else {
+                    (None, None)
+                };
                 self.mutate_app(app_id, |a| {
                     a.last_refreshed_at = Some(now);
                     a.expires_at = outcome.expires_at.or(a.expires_at);
                     a.last_error = None;
                     a.consecutive_failures = 0;
                     a.on_device = Some(true);
+                    a.name = outcome.name.clone();
                     a.version = outcome.version.clone().or(a.version.clone());
+                    a.original_bundle_id = outcome.original_bundle_id.clone();
                     a.bundle_id = outcome.bundle_id.clone();
+                    if let Some(p) = &new_source_path {
+                        a.source_path = p.clone();
+                    }
+                    if new_source_path.is_some() {
+                        if let Some(ref rel) = applied_release {
+                            if let Some(gh) = a.github.as_mut() {
+                                if expected_repo.as_deref().is_none_or(|r| gh.repo.eq_ignore_ascii_case(r)) {
+                                    gh.installed_release_id = Some(rel.release_id);
+                                    gh.installed_tag = Some(rel.tag.clone());
+                                    gh.installed_asset_name = Some(rel.asset.name.clone());
+                                    if gh.available_release.as_ref().map(|r| r.release_id) == Some(rel.release_id) {
+                                        gh.available_release = None;
+                                    }
+                                    gh.consecutive_update_failures = 0;
+                                    gh.last_check_error = None;
+                                }
+                            }
+                        }
+                    }
                 });
                 self.save_state();
                 self.emit_apps();
-                let ws = outcome.warnings.clone();
+                let mut ws = extra_warnings;
+                ws.extend(outcome.warnings.clone());
                 self.update_job(job_id, |j| j.warnings.extend(ws));
                 if background {
                     let until = outcome.expires_at.map(|e| format!(" Valid until {}.", fmt_date(e))).unwrap_or_default();
-                    self.notify("Refreshed", &format!("{}.{until}", rec.name));
+                    if let Some(tag) = updated_tag {
+                        self.notify("Updated", &format!("{} {tag} is on {}.{until}", outcome.name, rec.device_name));
+                    } else {
+                        self.notify("Refreshed", &format!("{}.{until}", rec.name));
+                    }
                 }
                 Ok(())
             }
             Err(fl) => {
-                // Device-away / sign-in-needed aren't signing failures: they
-                // shouldn't push the next attempt out with backoff.
-                let transient = matches!(fl.code.as_str(), "not_on_device" | "device_not_found" | "needs_2fa" | "needs_login");
+                // Device-away / locked / transient Wi-Fi drop / sign-in-needed aren't signing
+                // failures: they shouldn't push the next attempt out with 30m->12h backoff.
+                let transient = matches!(
+                    fl.code.as_str(),
+                    "not_on_device" | "device_not_found" | "device_locked" | "timeout" | "network" | "needs_2fa" | "needs_login"
+                );
                 if transient && fl.code != "not_on_device" {
                     // due_apps allows a retry after 5 minutes; make sure a
                     // check actually happens then.
@@ -1162,7 +1435,7 @@ impl Engine {
         }
     }
 
-    fn mutate_app(&self, id: &str, m: impl FnOnce(&mut AppRecord)) {
+    pub(crate) fn mutate_app(&self, id: &str, m: impl FnOnce(&mut AppRecord)) {
         let mut st = self.state.lock().unwrap();
         if let Some(a) = st.app_mut(id) {
             m(a);
@@ -1241,106 +1514,304 @@ impl Engine {
     // Devices
     // ------------------------------------------------------------------
 
-    pub async fn device_attached(self: &Arc<Self>, dev: loadside_core::idevice::usbmuxd::UsbmuxdDevice) {
-        let conn = match dev.connection_type {
-            loadside_core::idevice::usbmuxd::Connection::Network(_) => "wifi",
-            _ => "usb",
+    pub async fn device_attached(self: &Arc<Self>, dev: AttachedDevice) {
+        let (skip_probe, upgraded_to_usb) = {
+            let mut reg = self.device_registry.lock().unwrap();
+            reg.mux.insert(dev.device_id, (dev.udid.clone(), dev.connection.clone()));
+            let existing = reg.devices.get_mut(&dev.udid);
+            match existing {
+                // Already known & healthy over USB: a concurrent Wi-Fi attach doesn't need re-probing.
+                Some(d) if d.paired && d.connection == "usb" && dev.connection == "wifi" => (true, false),
+                // Already known & healthy over Wi-Fi and USB was plugged in: upgrade connection immediately.
+                Some(d) if d.paired && d.connection == "wifi" && dev.connection == "usb" => {
+                    d.connection = "usb".into();
+                    (true, true)
+                }
+                _ => (false, false),
+            }
         };
-        self.mux.lock().unwrap().insert(dev.device_id, (dev.udid.clone(), conn.to_string()));
-        let already_usb = self.devices.lock().unwrap().get(&dev.udid).is_some_and(|d| d.connection == "usb");
-        if already_usb && conn == "wifi" {
+        if upgraded_to_usb {
+            info!("Device switched to USB: {}", dev.udid);
+            self.emit(Event::Devices { devices: self.devices() });
+            self.trigger_check();
+        }
+        if skip_probe {
             return;
         }
-        // Give the device a moment (pairing/lockdown can lag the attach event).
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Brief settle pause (pairing/lockdown can lag the attach event slightly) without
+        // wasting short Wi-Fi wake windows.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let info = device::describe(&dev).await;
         let paired = info.paired;
-        {
-            // It may have gone (or a USB connection may have appeared) while
-            // we were talking to it.
-            let mux = self.mux.lock().unwrap();
-            if !mux.contains_key(&dev.device_id) {
+        let inserted = {
+            let mut reg = self.device_registry.lock().unwrap();
+            if !reg.mux.contains_key(&dev.device_id) {
                 return;
             }
-            let usb_present = mux.values().any(|(u, c)| *u == dev.udid && c == "usb");
-            let mut devs = self.devices.lock().unwrap();
-            if conn == "wifi" && usb_present && devs.get(&dev.udid).is_some_and(|d| d.connection == "usb") {
+            let effective = reg.effective_connection(&dev.udid).unwrap_or_else(|| dev.connection.clone());
+            if dev.connection == "wifi"
+                && effective == "usb"
+                && reg.devices.get(&dev.udid).is_some_and(|d| d.paired && d.connection == "usb")
+            {
                 return;
             }
             let mut info = info;
-            if usb_present {
-                info.connection = "usb".into();
+            info.connection = effective;
+            info!("Device connected: {} ({}, {}{})", info.name, info.udid, info.connection, if info.paired { "" } else { ", needs attention" });
+            reg.last_probe.insert(info.udid.clone(), Instant::now());
+            reg.devices.insert(info.udid.clone(), info);
+            true
+        };
+        if inserted {
+            self.emit(Event::Devices { devices: self.devices() });
+            self.remember_devices();
+            if paired {
+                // Wake the scheduler immediately so short Wi-Fi windows aren't lost waiting on
+                // a 60s installation_proxy sync; run sync_on_device concurrently in the background.
+                self.trigger_check();
+                let eng = self.clone();
+                let udid = dev.udid.clone();
+                tokio::spawn(async move { eng.sync_on_device(&udid).await });
             }
-            info!("Device connected: {} ({}, {})", info.name, info.udid, info.connection);
-            devs.insert(info.udid.clone(), info);
         }
-        self.emit(Event::Devices { devices: self.devices() });
-        self.remember_devices();
-        if paired {
-            self.sync_on_device(&dev.udid).await;
-        }
-        self.trigger_check();
     }
 
     pub fn device_detached(&self, mux_id: u32) {
-        let Some((udid, _)) = self.mux.lock().unwrap().remove(&mux_id) else { return };
-        let remaining: Option<String> = self.mux.lock().unwrap().values().find(|(u, _)| *u == udid).map(|(_, c)| c.clone());
-        {
-            let mut devs = self.devices.lock().unwrap();
+        let changed = {
+            let mut reg = self.device_registry.lock().unwrap();
+            let Some((udid, _)) = reg.mux.remove(&mux_id) else { return };
+            let remaining = reg.effective_connection(&udid);
             match remaining {
                 Some(conn) => {
-                    if let Some(d) = devs.get_mut(&udid) {
-                        d.connection = conn;
+                    if let Some(d) = reg.devices.get_mut(&udid) {
+                        if d.connection != conn {
+                            d.connection = conn;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
                 }
                 None => {
-                    if let Some(d) = devs.remove(&udid) {
-                        info!("Device disconnected: {}", d.name);
+                    reg.last_probe.remove(&udid);
+                    if let Some(d) = reg.devices.remove(&udid) {
+                        info!("Device disconnected: {} ({})", d.name, d.udid);
+                        true
+                    } else {
+                        false
                     }
                 }
             }
+        };
+        if changed {
+            self.emit(Event::Devices { devices: self.devices() });
         }
-        self.emit(Event::Devices { devices: self.devices() });
     }
 
     pub async fn refresh_devices(self: &Arc<Self>) -> Result<Vec<DeviceInfo>, Failure> {
-        // Every transport goes into the mux map (so unplugging USB falls back
-        // to Wi-Fi); one description per device, preferring USB.
+        self.reconcile_devices(true).await
+    }
+
+    /// Reconcile cached device state against live `usbmuxd` `ListDevices`.
+    ///
+    /// When `force_describe` is false, this is a sub-millisecond local socket check when
+    /// nothing changed, and only probes newly-seen devices or previously locked/problem
+    /// devices (at most once per 25s) concurrently.
+    pub async fn reconcile_devices(self: &Arc<Self>, force_describe: bool) -> Result<Vec<DeviceInfo>, Failure> {
+        let _guard = self.reconcile_lock.lock().await;
         let all = device::list_all().await.map_err(|e| errors::explain(&e))?;
-        let raw = device::list_raw().await.map_err(|e| errors::explain(&e))?;
-        let mut map = BTreeMap::new();
-        let mut mux = HashMap::new();
-        for d in &all {
-            mux.insert(d.device_id, (d.udid.clone(), if matches!(d.connection_type, loadside_core::idevice::usbmuxd::Connection::Network(_)) { "wifi".into() } else { "usb".into() }));
-        }
-        for d in &raw {
-            map.insert(d.udid.clone(), device::describe(d).await);
-        }
-        // Describing can take seconds per device; devices may have come or
-        // gone meanwhile. Trust a fresh listing for who's here now, and keep
-        // what the attach handler recorded for anything new.
-        if let Ok(now_all) = device::list_all().await {
-            mux = HashMap::new();
-            for d in &now_all {
-                mux.insert(d.device_id, (d.udid.clone(), if matches!(d.connection_type, loadside_core::idevice::usbmuxd::Connection::Network(_)) { "wifi".into() } else { "usb".into() }));
+        let best = device::prefer_best_connections(all.clone());
+
+        let (to_probe, mut list_changed) = {
+            let mut reg = self.device_registry.lock().unwrap();
+            let mut new_mux = HashMap::with_capacity(all.len());
+            for d in &all {
+                new_mux.insert(d.device_id, (d.udid.clone(), d.connection.clone()));
             }
-            let present: std::collections::HashSet<String> = now_all.iter().map(|d| d.udid.clone()).collect();
-            let current = self.devices.lock().unwrap().clone();
-            map.retain(|u, _| present.contains(u));
-            for u in &present {
-                if !map.contains_key(u) {
-                    if let Some(d) = current.get(u) {
-                        map.insert(u.clone(), d.clone());
+            reg.mux = new_mux;
+
+            let present: HashSet<&str> = best.iter().map(|d| d.udid.as_str()).collect();
+            let before_len = reg.devices.len();
+            reg.devices.retain(|u, d| {
+                let keep = present.contains(u.as_str());
+                if !keep {
+                    info!("Device no longer listed by usbmuxd: {} ({})", d.name, d.udid);
+                }
+                keep
+            });
+            reg.last_probe.retain(|u, _| present.contains(u.as_str()));
+            let mut changed = reg.devices.len() != before_len;
+
+            let mut probe_list = Vec::new();
+            let retry_interval = Duration::from_secs(25);
+            for d in best {
+                let effective = reg.effective_connection(&d.udid).unwrap_or_else(|| d.connection.clone());
+                if let Some(existing) = reg.devices.get_mut(&d.udid) {
+                    if existing.connection != effective {
+                        existing.connection = effective;
+                        changed = true;
                     }
+                    let needs_retry = (!existing.paired || existing.problem.is_some())
+                        && reg.last_probe.get(&d.udid).is_none_or(|t| t.elapsed() >= retry_interval);
+                    if force_describe || needs_retry {
+                        probe_list.push(d);
+                    }
+                } else {
+                    probe_list.push(d);
                 }
             }
+            (probe_list, changed)
+        };
+
+        let mut newly_usable: Vec<String> = Vec::new();
+        if !to_probe.is_empty() {
+            let probed = futures::future::join_all(to_probe.iter().map(|d| async move {
+                let info = device::describe(d).await;
+                (d.device_id, info)
+            }))
+            .await;
+
+            let mut reg = self.device_registry.lock().unwrap();
+            let now_inst = Instant::now();
+            for (device_id, mut info) in probed {
+                // Only commit if the device is still listed in mux (avoid resurrecting a
+                // device that detached while lockdown probe was in flight).
+                let still_present = reg.mux.contains_key(&device_id) || reg.mux.values().any(|(u, _)| *u == info.udid);
+                if !still_present {
+                    continue;
+                }
+                if let Some(effective) = reg.effective_connection(&info.udid) {
+                    info.connection = effective;
+                }
+                let prev = reg.devices.get(&info.udid);
+                let was_paired = prev.is_some_and(|d| d.paired);
+                if prev != Some(&info) {
+                    if prev.is_none() || (!was_paired && info.paired) {
+                        info!("Device discovered via sync: {} ({}, {})", info.name, info.udid, info.connection);
+                    }
+                    list_changed = true;
+                }
+                if !was_paired && info.paired {
+                    newly_usable.push(info.udid.clone());
+                }
+                reg.last_probe.insert(info.udid.clone(), now_inst);
+                reg.devices.insert(info.udid.clone(), info);
+            }
         }
-        *self.devices.lock().unwrap() = map;
-        *self.mux.lock().unwrap() = mux;
+
         let list = self.devices();
-        self.emit(Event::Devices { devices: list.clone() });
-        self.remember_devices();
+        if list_changed || force_describe {
+            self.emit(Event::Devices { devices: list.clone() });
+            self.remember_devices();
+        }
+        if !newly_usable.is_empty() {
+            self.trigger_check();
+            for udid in newly_usable {
+                let eng = self.clone();
+                tokio::spawn(async move { eng.sync_on_device(&udid).await });
+            }
+        }
         Ok(list)
+    }
+
+    /// Periodically reconcile `usbmuxd` device state (catching missed events, Mac wake
+    /// from sleep, and unlocked iPhones) and gently nudge Bonjour discovery when an
+    /// auto-refresh app is due but its device isn't listed yet.
+    pub async fn device_reconciler(self: Arc<Self>) {
+        let mut last_wall = loadside_core::now();
+        let mut last_nudge = Instant::now() - Duration::from_secs(3600);
+        loop {
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            let now_wall = loadside_core::now();
+            let woke_from_sleep = now_wall - last_wall > 90;
+            last_wall = now_wall;
+
+            if woke_from_sleep {
+                info!("Mac woke from sleep; reconciling connected devices");
+            }
+            if let Err(fl) = self.reconcile_devices(false).await {
+                warn!("Periodic device sync failed: {}", fl.message);
+            }
+
+            // If an app is due for auto-refresh (or within 24h of expiry) and its device
+            // isn't currently connected, run a brief Bonjour browse (at most every 3 min)
+            // to nudge an unlocked iPhone on the same Wi-Fi to re-announce to usbmuxd.
+            if self.has_missing_due_device() && last_nudge.elapsed() >= Duration::from_secs(180) {
+                last_nudge = Instant::now();
+                device::nudge_wifi_discovery().await;
+                let _ = self.reconcile_devices(false).await;
+            }
+        }
+    }
+
+    fn has_missing_due_device(&self) -> bool {
+        let cfg = self.config();
+        if !cfg.auto_refresh || self.needs_interactive_login.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = loadside_core::now();
+        let threshold = cfg.refresh_threshold_hours as i64 * 3600;
+        let st = self.state.lock().unwrap();
+        if st.account.is_none() {
+            return false;
+        }
+        st.apps.iter().any(|a| {
+            if !a.options.auto_refresh || a.on_device == Some(false) {
+                return false;
+            }
+            let due = match a.expires_at {
+                Some(e) => e - now < threshold,
+                None => now - a.last_refreshed_at.unwrap_or(a.installed_at) > 6 * 24 * 3600,
+            };
+            due && !self.device_usable(&a.device_udid)
+        })
+    }
+
+    /// Notify once (at most every 12h per app) when an auto-refresh app is within
+    /// 24 hours of expiring and its device isn't reachable/unlocked.
+    fn check_expiring_reminders(&self) {
+        let cfg = self.config();
+        if !cfg.auto_refresh || self.needs_interactive_login.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = loadside_core::now();
+        let urgent: Vec<(String, String, String, i64)> = {
+            let st = self.state.lock().unwrap();
+            if st.account.is_none() {
+                return;
+            }
+            st.apps
+                .iter()
+                .filter(|a| a.options.auto_refresh && a.on_device != Some(false))
+                .filter_map(|a| {
+                    let exp = a.expires_at?;
+                    let left = exp - now;
+                    if left > 0 && left <= 24 * 3600 && !self.device_usable(&a.device_udid) {
+                        Some((a.id.clone(), a.name.clone(), a.device_name.clone(), left))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if urgent.is_empty() {
+            return;
+        }
+        let mut reminded = self.expiry_reminded.lock().unwrap();
+        for (id, name, dev, left) in urgent {
+            if reminded.get(&id).is_some_and(|&ts| now - ts < 12 * 3600) {
+                continue;
+            }
+            reminded.insert(id, now);
+            let hours = (left / 3600).max(1);
+            let dev_label = if dev.is_empty() { "your iPhone" } else { &dev };
+            self.notify(
+                &format!("{name} expires in ~{hours}h"),
+                &format!("Unlock {dev_label} near this Mac (or plug it in) so Loadside can refresh it."),
+            );
+        }
     }
 
     /// Record paired devices (and what we learned about them) in the state so
@@ -1428,7 +1899,7 @@ impl Engine {
     // ------------------------------------------------------------------
 
     pub(crate) fn set_devices(&self, upd: impl FnOnce(&mut BTreeMap<String, DeviceInfo>) -> bool) {
-        let changed = upd(&mut self.devices.lock().unwrap());
+        let changed = upd(&mut self.device_registry.lock().unwrap().devices);
         if changed {
             self.emit(Event::Devices { devices: self.devices() });
         }
@@ -1440,7 +1911,14 @@ impl Engine {
 
     pub async fn scheduler(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<()>) {
         loop {
-            let interval = self.config().check_interval_minutes as i64 * 60;
+            let cfg = self.config();
+            let refresh_interval = cfg.check_interval_minutes as i64 * 60;
+            let has_github = self.state.lock().unwrap().apps.iter().any(|a| a.github.is_some());
+            let interval = if has_github {
+                refresh_interval.min(cfg.release_check_interval_minutes as i64 * 60)
+            } else {
+                refresh_interval
+            };
             let deadline = loadside_core::now() + interval;
             self.next_check_at.store(deadline, Ordering::Relaxed);
             self.emit(Event::Schedule { next_check_at: Some(deadline) });
@@ -1456,12 +1934,24 @@ impl Engine {
             tokio::select! {
                 _ = until_deadline => {}
                 Some(_) = rx.recv() => {
-                    // Debounce bursts (Wi-Fi devices flap, several attach events...).
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Brief debounce for bursts (several attach events at once), kept short
+                    // so we don't miss brief Wi-Fi wake windows.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     while rx.try_recv().is_ok() {}
                 }
             }
+            // Reconcile against live usbmuxd before evaluating due refreshes/updates.
+            let _ = self.reconcile_devices(false).await;
+            // Queue urgent expiry refreshes & ready immediate updates FIRST so GitHub
+            // network I/O can never stall an expiring app's refresh.
             self.check_refreshes();
+            self.check_expiring_reminders();
+            // Run due GitHub release checks in the background (if new immediate updates
+            // are discovered, check_updates triggers check_refreshes itself).
+            let eng = self.clone();
+            tokio::spawn(async move {
+                eng.check_updates_due().await;
+            });
             // A daemon can run for months: keep hand-off folders tidy too.
             self.sweep_staging(Duration::from_secs(3 * 24 * 3600));
         }
@@ -1494,8 +1984,8 @@ impl Engine {
             })
             .filter(|a| {
                 // Backoff after failures: 30m, 1h, 2h, 4h ... capped at 12h.
-                // Transient misses (device away, sign-in needed) don't count
-                // as failures and only wait a few minutes.
+                // Transient misses (device away, locked, Wi-Fi timeout, sign-in needed)
+                // don't count as failures and only wait a few minutes.
                 let Some(last) = a.last_attempt_at else { return true };
                 let backoff = match a.consecutive_failures {
                     0 => 300,
@@ -1503,22 +1993,37 @@ impl Engine {
                 };
                 now - last > backoff
             })
-            .filter(|a| self.device_connected(&a.device_udid))
+            .filter(|a| self.device_usable(&a.device_udid))
             .filter(|a| !self.job_active_for_app(&a.id))
             .map(|a| a.id.clone())
             .collect()
     }
 
-    fn check_refreshes(&self) {
+    pub(crate) fn check_refreshes(&self) {
+        for id in self.due_updates() {
+            match self.enqueue(JobSpec::Update { app_id: id.clone() }, true) {
+                Ok(j) => info!("Auto-update queued for app {id} (job {j})"),
+                Err(e) => warn!("Couldn't queue auto-update for {id}: {}", e.message),
+            }
+        }
         for id in self.due_apps() {
-            match self.enqueue(JobSpec::Refresh { app_id: id.clone(), reinstall: false }, true) {
+            match self.enqueue(JobSpec::Refresh { app_id: id.clone(), reinstall: false, skip_update: false }, true) {
                 Ok(j) => info!("Auto-refresh queued for app {id} (job {j})"),
                 Err(e) => warn!("Couldn't queue auto-refresh for {id}: {}", e.message),
             }
         }
     }
 
-    pub fn refresh_all(&self) -> Vec<String> {
+    pub async fn refresh_all(self: &Arc<Self>) -> Vec<String> {
+        let missing_any = {
+            let st = self.state.lock().unwrap();
+            st.apps
+                .iter()
+                .any(|a| a.on_device != Some(false) && !self.device_connected(&a.device_udid))
+        };
+        if missing_any {
+            let _ = self.reconcile_devices(false).await;
+        }
         // Apps deleted from their device stay deleted: only Reinstall brings one back.
         let ids: Vec<String> = self
             .state
@@ -1529,7 +2034,7 @@ impl Engine {
             .filter(|a| a.on_device != Some(false) && self.device_connected(&a.device_udid))
             .map(|a| a.id.clone())
             .collect();
-        ids.into_iter().filter_map(|id| self.enqueue(JobSpec::Refresh { app_id: id, reinstall: false }, false).ok()).collect()
+        ids.into_iter().filter_map(|id| self.enqueue(JobSpec::Refresh { app_id: id, reinstall: false, skip_update: false }, false).ok()).collect()
     }
 
     pub fn set_config(self: &Arc<Self>, patch: Value) -> Result<Value, Failure> {

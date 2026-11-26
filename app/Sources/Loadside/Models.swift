@@ -122,6 +122,121 @@ struct InstallOptions: Codable, Hashable, Sendable {
     var allowSigningKey: Bool = false
 }
 
+enum UpdatePolicy: String, Codable, CaseIterable, Identifiable, Sendable {
+    case immediate
+    case onRefresh = "on_refresh"
+    case manual
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .immediate: "As soon as available"
+        case .onRefresh: "On next refresh"
+        case .manual: "Manual"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .immediate: "Auto-update"
+        case .onRefresh: "On refresh"
+        case .manual: "Manual"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .immediate: "Downloads and installs new releases automatically as soon as your device connects."
+        case .onRefresh: "Waits until this app refreshes, then installs the new release in the same step."
+        case .manual: "Checks for new releases and shows a badge; installs only when you click Update."
+        }
+    }
+}
+
+struct ReleaseAsset: Codable, Hashable, Identifiable, Sendable {
+    var id: UInt64
+    var name: String
+    var downloadUrl: String
+    var apiUrl: String
+    var size: UInt64
+    var digest: String?
+}
+
+struct ReleaseInfo: Codable, Hashable, Sendable {
+    var releaseId: UInt64
+    var tag: String
+    var name: String?
+    var htmlUrl: String
+    var publishedAt: Int?
+    var body: String?
+    var prerelease: Bool
+    var asset: ReleaseAsset
+}
+
+struct GitHubSource: Codable, Hashable, Sendable {
+    var repo: String
+    var repoId: UInt64?
+    var assetPattern: String?
+    var includePrereleases: Bool = false
+    var policy: UpdatePolicy = .onRefresh
+    var installedReleaseId: UInt64?
+    var installedTag: String?
+    var installedAssetName: String?
+    var availableRelease: ReleaseInfo?
+    var lastCheckedAt: Int?
+    var etag: String?
+    var lastCheckError: Failure?
+    var lastUpdateAttemptAt: Int?
+    var consecutiveUpdateFailures: Int = 0
+}
+
+struct GitHubInspectResult: Codable, Sendable {
+    var repo: String
+    var repoId: UInt64?
+    var release: ReleaseInfo
+    var assets: [ReleaseAsset]
+    var suggestedPatterns: [String: String]?
+}
+
+struct GitHubDownloadResult: Codable, Sendable {
+    var repo: String
+    var repoId: UInt64?
+    var path: String
+    var info: IpaInfo
+    var appIdsNeeded: Int
+    var release: ReleaseInfo
+    var assetPattern: String?
+}
+
+struct CheckUpdatesResult: Codable, Sendable {
+    var checked: Int
+    var updatesAvailable: Int
+    var failed: Int?
+}
+
+enum GitHubURL {
+    /// Extract a clean "owner/repo" display label from either a full GitHub URL or slug.
+    static func displayRepo(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let u = URL(string: s), let host = u.host?.lowercased(), host == "github.com" || host == "www.github.com" {
+            let comps = u.path.split(separator: "/").map(String.init)
+            if comps.count >= 2 {
+                let repo = comps[1].hasSuffix(".git") ? String(comps[1].dropLast(4)) : comps[1]
+                return "\(comps[0])/\(repo)"
+            }
+        }
+        return s
+    }
+
+    /// Only open https://github.com URLs in the browser.
+    static func safeWebURL(_ raw: String) -> URL? {
+        guard let u = URL(string: raw), u.scheme == "https",
+              let host = u.host?.lowercased(), host == "github.com" || host == "www.github.com" else { return nil }
+        return u
+    }
+}
+
 struct AppRecord: Codable, Hashable, Identifiable, Sendable {
     var id: String
     var name: String
@@ -141,6 +256,7 @@ struct AppRecord: Codable, Hashable, Identifiable, Sendable {
     var lastError: Failure?
     var consecutiveFailures: Int
     var onDevice: Bool?
+    var github: GitHubSource?
 
     var expiresDate: Date? { expiresAt.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
 }
@@ -164,7 +280,7 @@ struct DeviceInfo: Codable, Hashable, Identifiable, Sendable {
 }
 
 enum JobStatus: String, Codable, Sendable { case queued, running, succeeded, failed, cancelled }
-enum JobKind: String, Codable, Sendable { case install, refresh, export, login }
+enum JobKind: String, Codable, Sendable { case install, refresh, update, export, login }
 
 struct JobInfo: Codable, Hashable, Identifiable, Sendable {
     var id: String
@@ -203,6 +319,7 @@ struct DaemonConfig: Codable, Hashable, Sendable {
     var autoRefresh: Bool
     var refreshThresholdHours: Int
     var checkIntervalMinutes: Int
+    var releaseCheckIntervalMinutes: Int?
     var machineName: String
     var notifications: Bool
     var autoRevokeOwnCerts: Bool
@@ -223,6 +340,7 @@ struct Snapshot: Codable, Sendable {
     var prompts: [Prompt]
     var config: DaemonConfig
     var nextCheckAt: Int?
+    var githubTokenSet: Bool?
 }
 
 struct SubBundle: Codable, Hashable, Sendable {
@@ -293,6 +411,7 @@ struct InstallParams: Encodable {
     var options: InstallOptions
     var exportPath: String?
     var install: Bool
+    var github: GitHubSource? = nil
 }
 
 struct JobRef: Decodable { var jobId: String }

@@ -10,7 +10,7 @@ use loadside_core::{
     client::Client,
     paths,
     protocol::{Event, Failure, JobInfo, JobStatus, Prompt, Snapshot},
-    state::{AppRecord, ExtensionsMode, InstallOptions},
+    state::{AppRecord, ExtensionsMode, GitHubSource, InstallOptions, ReleaseInfo, UpdatePolicy},
 };
 use serde_json::{Value, json};
 
@@ -32,6 +32,26 @@ enum ExtArg {
     Reuse,
     /// Remove extensions
     Strip,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PolicyArg {
+    /// Download and install as soon as a new release appears
+    Immediate,
+    /// Install the new release the next time the app refreshes
+    OnRefresh,
+    /// Notify only; update when you run `loadside update`
+    Manual,
+}
+
+impl From<PolicyArg> for UpdatePolicy {
+    fn from(p: PolicyArg) -> Self {
+        match p {
+            PolicyArg::Immediate => UpdatePolicy::Immediate,
+            PolicyArg::OnRefresh => UpdatePolicy::OnRefresh,
+            PolicyArg::Manual => UpdatePolicy::Manual,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -61,9 +81,22 @@ enum Cmd {
     Devices,
     /// Show what's inside an IPA
     Inspect { path: PathBuf },
-    /// Sign and install an IPA
+    /// Sign and install an IPA (from a local file or a GitHub repository)
     Install {
-        path: PathBuf,
+        /// Local .ipa or .app path (omit when using --github)
+        path: Option<PathBuf>,
+        /// Download and track releases from a GitHub repo (owner/repo or URL)
+        #[arg(long, value_name = "OWNER/REPO")]
+        github: Option<String>,
+        /// When to install new GitHub releases (used with --github)
+        #[arg(long, value_enum, default_value_t = PolicyArg::OnRefresh)]
+        update_policy: PolicyArg,
+        /// Include GitHub prereleases (used with --github)
+        #[arg(long)]
+        prereleases: bool,
+        /// Substring or wildcard filter when a GitHub release has multiple .ipa assets
+        #[arg(long, value_name = "PATTERN")]
+        asset: Option<String>,
         /// Device UDID (defaults to the only connected device)
         #[arg(short, long)]
         device: Option<String>,
@@ -110,6 +143,43 @@ enum Cmd {
     },
     /// List installed apps and their expiry
     Apps,
+    /// Connect or configure GitHub release tracking for an installed app
+    Track {
+        app_id: String,
+        /// GitHub repository (owner/repo or URL)
+        repo: Option<String>,
+        /// When to install new releases
+        #[arg(long, value_enum)]
+        policy: Option<PolicyArg>,
+        /// Track prereleases
+        #[arg(long, conflicts_with = "no_prereleases")]
+        prereleases: bool,
+        /// Only track stable releases
+        #[arg(long)]
+        no_prereleases: bool,
+        /// Substring or wildcard filter for releases with multiple .ipa assets (empty to clear)
+        #[arg(long)]
+        asset: Option<String>,
+        /// Disconnect GitHub release tracking from this app
+        #[arg(long)]
+        disconnect: bool,
+    },
+    /// Check GitHub for newer releases (for one app or all tracked apps)
+    CheckUpdates {
+        app_id: Option<String>,
+    },
+    /// Download and install the latest GitHub release for a tracked app
+    Update {
+        app_id: String,
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Save or clear an optional GitHub token in Keychain (for private repos / higher rate limits)
+    GithubToken {
+        /// Remove the saved GitHub token
+        #[arg(long)]
+        clear: bool,
+    },
     /// Re-sign and reinstall an app now (or all with --all)
     Refresh {
         app_id: Option<String>,
@@ -453,11 +523,14 @@ async fn run(cli: Cli) -> Result<()> {
             println!("App IDs needed (default options): {}", v["app_ids_needed"]);
         }
         Cmd::Install {
-            path, device, bundle_id, name, extensions, keep_watch, keep_device_restrictions, file_sharing,
+            path, github, update_policy, prereleases, asset, device, bundle_id, name, extensions, keep_watch, keep_device_restrictions, file_sharing,
             increased_memory_limit, inject, export, no_install, no_auto_refresh, allow_encrypted, allow_signing_key, detach,
         } => {
             if no_install && export.is_none() {
                 bail!("--no-install needs --export <OUT.ipa> (otherwise the signed app would be thrown away)");
+            }
+            if path.is_none() && github.is_none() {
+                bail!("give an .ipa path or --github <owner/repo>");
             }
             if keep_watch {
                 eprintln!("note: --keep-watch has no effect; Apple Watch apps can't be signed and are always removed");
@@ -495,15 +568,78 @@ async fn run(cli: Cli) -> Result<()> {
             if !detach {
                 subscribe(&c).await?;
             }
-            let staged_path = stage(&path)?;
+
             let mut staged = made;
-            if abs(&path).map(PathBuf::from).ok() != Some(PathBuf::from(&staged_path)) {
-                staged.push(PathBuf::from(&staged_path));
-            }
-            let v = call(&c, "install", json!({
+            let (staged_path, github_source) = match (path, github) {
+                (Some(p), gh) => {
+                    let sp = stage(&p)?;
+                    if abs(&p).map(PathBuf::from).ok() != Some(PathBuf::from(&sp)) {
+                        staged.push(PathBuf::from(&sp));
+                    }
+                    let gh_src = match gh {
+                        Some(repo_in) => {
+                            let repo = loadside_core::github::parse_repo(&repo_in).map_err(anyhow::Error::new)?;
+                            eprintln!("Note: Only track GitHub repositories from developers you trust; future releases will be signed with your Apple ID.");
+                            Some(GitHubSource {
+                                repo,
+                                asset_pattern: asset.filter(|s| !s.trim().is_empty()),
+                                include_prereleases: prereleases,
+                                policy: update_policy.into(),
+                                ..Default::default()
+                            })
+                        }
+                        None => None,
+                    };
+                    (sp, gh_src)
+                }
+                (None, Some(repo_in)) => {
+                    eprintln!("Note: Only install from GitHub repositories of developers you trust; future releases will be signed with your Apple ID.");
+                    eprintln!("Downloading latest release from {repo_in}…");
+                    let dl = call(&c, "github_download", json!({
+                        "repo": repo_in,
+                        "include_prereleases": prereleases,
+                        "asset_pattern": asset,
+                    })).await?;
+                    let sp = dl["path"].as_str().context("daemon returned no downloaded path")?.to_string();
+                    staged.push(PathBuf::from(&sp));
+                    let repo = dl["repo"].as_str().unwrap_or(&repo_in).to_string();
+                    let repo_id = dl["repo_id"].as_u64();
+                    let rel: ReleaseInfo = match serde_json::from_value(dl["release"].clone()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            unstage_unused(&c, &staged).await;
+                            return Err(e.into());
+                        }
+                    };
+                    let inferred_pattern = dl["asset_pattern"].as_str().map(str::to_string);
+                    eprintln!("✓ Downloaded {} ({})", rel.tag, rel.asset.name);
+                    let gh_src = GitHubSource {
+                        repo,
+                        repo_id,
+                        asset_pattern: inferred_pattern,
+                        include_prereleases: prereleases,
+                        policy: update_policy.into(),
+                        installed_release_id: Some(rel.release_id),
+                        installed_tag: Some(rel.tag),
+                        installed_asset_name: Some(rel.asset.name),
+                        last_checked_at: Some(loadside_core::now()),
+                        ..Default::default()
+                    };
+                    (sp, Some(gh_src))
+                }
+                (None, None) => unreachable!(),
+            };
+
+            let v = match call(&c, "install", json!({
                 "path": staged_path, "device_udid": device, "options": options,
-                "export_path": export, "install": !no_install,
-            })).await?;
+                "export_path": export, "install": !no_install, "github": github_source,
+            })).await {
+                Ok(v) => v,
+                Err(e) => {
+                    unstage_unused(&c, &staged).await;
+                    return Err(e);
+                }
+            };
             let job = v["job_id"].as_str().unwrap_or("").to_string();
             if detach {
                 // The daemon sweeps leftovers it no longer needs.
@@ -522,25 +658,111 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let apps: Vec<AppRecord> = serde_json::from_value(v)?;
             if apps.is_empty() {
-                println!("No apps yet. Install one with `loadside install App.ipa`.");
+                println!("No apps yet. Install one with `loadside install App.ipa` or `loadside install --github owner/repo`.");
             }
             for a in apps {
                 let exp = match a.expires_at {
                     Some(e) => format!("expires {}", rel(e)),
                     None => "expiry unknown".into(),
                 };
-                let flags = [
-                    (!a.options.auto_refresh).then_some("auto-refresh off"),
-                    (a.on_device == Some(false)).then_some("not on device"),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(", ");
-                println!("{}  {} {}  on {}  {}{}", a.id, a.name, a.version.unwrap_or_default(), a.device_name, exp, if flags.is_empty() { String::new() } else { format!("  [{flags}]") });
-                if let Some(e) = a.last_error {
-                    println!("          ⚠ last refresh failed: {}", e.message);
+                let mut flags: Vec<String> = Vec::new();
+                if !a.options.auto_refresh {
+                    flags.push("auto-refresh off".into());
                 }
+                if a.on_device == Some(false) {
+                    flags.push("not on device".into());
+                }
+                if let Some(gh) = &a.github {
+                    let pol = match gh.policy {
+                        UpdatePolicy::Immediate => "immediate",
+                        UpdatePolicy::OnRefresh => "on-refresh",
+                        UpdatePolicy::Manual => "manual",
+                    };
+                    flags.push(format!("github: {} ({pol})", gh.repo));
+                    if let Some(avail) = &gh.available_release {
+                        flags.push(format!("update {} available", avail.tag));
+                    }
+                }
+                let flag_str = if flags.is_empty() { String::new() } else { format!("  [{}]", flags.join(", ")) };
+                println!("{}  {} {}  on {}  {}{flag_str}", a.id, a.name, a.version.unwrap_or_default(), a.device_name, exp);
+                if let Some(e) = a.last_error {
+                    println!("          ⚠ last job failed: {}", e.message);
+                }
+                if let Some(e) = a.github.as_ref().and_then(|g| g.last_check_error.as_ref()) {
+                    println!("          ⚠ github check failed: {}", e.message);
+                }
+            }
+        }
+        Cmd::Track { app_id, repo, policy, prereleases, no_prereleases, asset, disconnect } => {
+            let mut params = json!({ "app_id": app_id, "disconnect": disconnect });
+            if let Some(r) = repo {
+                if !disconnect {
+                    eprintln!("Note: Only connect GitHub repositories from developers you trust; future releases will be signed with your Apple ID.");
+                }
+                params["repo"] = json!(r);
+            }
+            if let Some(p) = policy {
+                params["policy"] = json!(UpdatePolicy::from(p));
+            }
+            if prereleases {
+                params["include_prereleases"] = json!(true);
+            } else if no_prereleases {
+                params["include_prereleases"] = json!(false);
+            }
+            if let Some(a) = asset {
+                params["asset_pattern"] = if a.trim().is_empty() { Value::Null } else { json!(a) };
+            }
+            call(&c, "set_app_github", params).await?;
+            if disconnect {
+                println!("Disconnected GitHub release tracking.");
+            } else {
+                println!("✓ GitHub release tracking updated.");
+            }
+        }
+        Cmd::CheckUpdates { app_id } => {
+            let v = call(&c, "check_updates", json!({ "app_id": app_id, "force": true })).await?;
+            if json_out {
+                print(&v);
+                return Ok(());
+            }
+            let checked = v["checked"].as_u64().unwrap_or(0);
+            let avail = v["updates_available"].as_u64().unwrap_or(0);
+            let failed = v["failed"].as_u64().unwrap_or(0);
+            if failed > 0 {
+                println!("Checked {checked} repo{}. {avail} update{} available, {failed} check{} failed (run `loadside apps` for details).",
+                    if checked == 1 { "" } else { "s" },
+                    if avail == 1 { "" } else { "s" },
+                    if failed == 1 { "" } else { "s" });
+            } else {
+                println!("Checked {checked} repo{}. {avail} update{} available.",
+                    if checked == 1 { "" } else { "s" },
+                    if avail == 1 { "" } else { "s" });
+            }
+        }
+        Cmd::Update { app_id, detach } => {
+            if !detach {
+                subscribe(&c).await?;
+            }
+            let v = call(&c, "update_release", json!({ "app_id": app_id })).await?;
+            let job = v["job_id"].as_str().unwrap_or("").to_string();
+            if detach {
+                println!("Queued job {job}");
+            } else {
+                follow_job(&c, &job).await?;
+            }
+        }
+        Cmd::GithubToken { clear } => {
+            if clear {
+                call(&c, "set_github_token", json!({ "token": Value::Null })).await?;
+                println!("Removed GitHub token from Keychain.");
+            } else {
+                let tok = rpassword::prompt_password("GitHub personal access token: ")?;
+                let tok = tok.trim().to_string();
+                if tok.is_empty() {
+                    bail!("no token entered (use --clear to remove an existing token)");
+                }
+                call(&c, "set_github_token", json!({ "token": tok })).await?;
+                println!("✓ GitHub token saved in Keychain.");
             }
         }
         Cmd::Refresh { app_id, all, reinstall, detach } => {

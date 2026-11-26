@@ -6,11 +6,13 @@ struct InstallSheet: View {
     @Environment(Store.self) private var store
     @Environment(\.dismiss) private var dismiss
     let source: URL
+    var github: GitHubSource? = nil
 
     @State private var staged: String?
     @State private var inspect: InspectResult?
     @State private var inspectError: Failure?
     @State private var options = InstallOptions()
+    @State private var githubPolicy: UpdatePolicy = .onRefresh
     @State private var deviceUdid = ""
     @State private var jobId: String?
     @State private var busy = false
@@ -45,7 +47,10 @@ struct InstallSheet: View {
         // Retries once the background service connects (opening an IPA can
         // launch Loadside before it's up).
         .task(id: store.connection == .connected) { if inspect == nil { await load() } }
-        .onAppear { if deviceUdid.isEmpty { deviceUdid = store.devices.first?.udid ?? "" } }
+        .onAppear {
+            if deviceUdid.isEmpty { deviceUdid = store.devices.first?.udid ?? "" }
+            if let github { githubPolicy = github.policy }
+        }
         .onChange(of: store.devices) { old, devs in
             if let lost = lostDevice, devs.contains(where: { $0.udid == lost.udid }) {
                 // It came back.
@@ -75,6 +80,7 @@ struct InstallSheet: View {
                 }
                 if let e = job?.error { FailureView(failure: e) }
                 deviceRow
+                if let github { githubRow(github) }
                 slotsRow
                 budgetRow
                 if needsKeyConsent { keyConsent }
@@ -151,6 +157,25 @@ struct InstallSheet: View {
                 .labelsHidden().fixedSize()
                 Spacer()
             }
+        }
+    }
+
+    private func githubRow(_ gh: GitHubSource) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.triangle.branch").frame(width: 20).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(gh.repo).font(.callout.weight(.medium))
+                    if let tag = gh.installedTag { Tag(text: tag, color: .accentColor) }
+                }
+                Text("Tracked for GitHub release updates").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Picker("", selection: $githubPolicy) {
+                ForEach(UpdatePolicy.allCases) { p in Text(p.label).tag(p) }
+            }
+            .labelsHidden()
+            .fixedSize()
         }
     }
 
@@ -500,7 +525,12 @@ struct InstallSheet: View {
         if let staged { store.liveStaging.remove(staged) }
         if busy || (job?.isActive ?? false) { return }
         store.forgetStaged(job: jobId)
-        for p in [staged].compactMap({ $0 }) + options.inject { store.unstageIfUnused(p) }
+        var toClean = [staged].compactMap { $0 } + options.inject
+        // If dismissed before load() finished, still clean up a GitHub download already in Incoming/<uuid>/.
+        if staged == nil && Store.stagingDir(source.path) != nil {
+            toClean.append(source.path)
+        }
+        for p in toClean { store.unstageIfUnused(p) }
     }
 
     private var stagedInputs: [String] { [staged].compactMap { $0 } + options.inject }
@@ -563,8 +593,10 @@ struct InstallSheet: View {
         busy = true
         defer { busy = false }
         let inputs = stagedInputs
+        var ghToAttach = github
+        ghToAttach?.policy = githubPolicy
         jobId = await store.run {
-            try await store.install(InstallParams(path: staged, deviceUdid: target, options: options, exportPath: nil, install: true))
+            try await store.install(InstallParams(path: staged, deviceUdid: target, options: options, exportPath: nil, install: true, github: ghToAttach))
         }
         if let jobId { store.unstageWhenDone(job: jobId, paths: inputs) }
     }

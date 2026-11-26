@@ -8,6 +8,7 @@ struct MenuBarView: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 60)) { _ in panel }
+            .onAppear { Task { await store.refreshDevicesIfStale(minInterval: 15) } }
     }
 
     private var panel: some View {
@@ -58,6 +59,16 @@ struct MenuBarView: View {
                                 // deliberate choice made in the app's details.
                                 Text("Deleted").font(.caption).foregroundStyle(.secondary)
                             } else {
+                                if let rel = app.github?.availableRelease {
+                                    Button {
+                                        Task { await store.updateRelease(app) }
+                                    } label: {
+                                        Tag(text: rel.tag, color: .accentColor)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(store.devices.contains { $0.udid == app.deviceUdid } ? "Update \(app.name) to \(rel.tag)" : "Connect \(app.deviceName) first")
+                                    .disabled(store.activeJobs.contains { $0.appId == app.id } || !store.devices.contains { $0.udid == app.deviceUdid })
+                                }
                                 ExpiryBadge(expiresAt: app.expiresAt)
                                 Button { Task { await store.refresh(app) } } label: {
                                     Image(systemName: "arrow.clockwise")
@@ -79,6 +90,7 @@ struct MenuBarView: View {
                     MenuButton("Refresh All Apps", icon: "arrow.clockwise") { Task { await store.refreshAll() } }
                 }
                 MenuButton("Install an App…", icon: "plus") { open("install") }
+                MenuButton("Install from GitHub…", icon: "arrow.down.circle") { open("install_github") }
                 MenuButton("Open Loadside", icon: "macwindow") { open(nil) }
                 Divider().padding(.vertical, 4)
                 MenuButton("Quit Loadside", icon: "power") { NSApp.terminate(nil) }

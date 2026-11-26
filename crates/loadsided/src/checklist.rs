@@ -89,12 +89,12 @@ impl Engine {
     }
 
     /// Open a connection through usbmuxd (USB or Wi-Fi sync).
+    /// Queries live usbmuxd directly if the cached device list is stale.
     pub(crate) async fn connect(&self, udid: &str) -> Result<Conn, Failure> {
-        if !self.device_connected(udid) {
-            return Err(f("device_not_found", &format!("{} isn't connected.", self.device_name(udid))).with_hint(NOT_CONNECTED_HINT));
+        match device::provider_for(udid).await {
+            Ok(p) => Ok(Conn(p)),
+            Err(_) => Err(f("device_not_found", &format!("{} isn't connected.", self.device_name(udid))).with_hint(NOT_CONNECTED_HINT)),
         }
-        let p = device::provider_for(udid).await.map_err(|e| errors::explain(&e))?;
-        Ok(Conn(p))
     }
 
     fn require_usb(&self, udid: &str) -> Result<DeviceInfo, Failure> {
@@ -143,6 +143,9 @@ impl Engine {
     pub async fn setup_status(self: &Arc<Self>, force: bool) -> SetupReport {
         let cfg = self.config();
         let (apple, anisette) = net_checks(&cfg.anisette_url, force).await;
+        if force {
+            let _ = self.reconcile_devices(true).await;
+        }
         let devices = self.devices();
         let st = self.state.lock().unwrap().clone();
         let mut checks = vec![];
