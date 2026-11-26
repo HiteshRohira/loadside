@@ -189,7 +189,6 @@ pub async fn run(
             p3(stage, 0.65 + (pct as f32 / 100.0) * 0.35)
         })
         .await
-        .rc()
         .context("installation failed")?;
         info!("Installed {} ({})", final_info.name, final_info.bundle_id);
     }

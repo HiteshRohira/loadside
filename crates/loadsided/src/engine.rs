@@ -20,7 +20,7 @@ use loadside_core::{
 };
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::logging::LogBuffer;
 use crate::notify;
@@ -57,6 +57,8 @@ struct DeviceRegistry {
     mux: HashMap<u32, (String, String)>,
     /// Last time we probed lockdown for a UDID (used to auto-retry locked devices).
     last_probe: HashMap<String, Instant>,
+    /// Devices reachable only through CoreDevice's Wi-Fi tunnel (not listed by usbmuxd).
+    core: HashSet<String>,
 }
 
 impl DeviceRegistry {
@@ -1594,6 +1596,13 @@ impl Engine {
                         false
                     }
                 }
+                None if reg.core.contains(&udid) => match reg.devices.get_mut(&udid) {
+                    Some(d) if d.connection != "wifi" => {
+                        d.connection = "wifi".into();
+                        true
+                    }
+                    _ => false,
+                },
                 None => {
                     reg.last_probe.remove(&udid);
                     if let Some(d) = reg.devices.remove(&udid) {
@@ -1621,9 +1630,21 @@ impl Engine {
     /// devices (at most once per 25s) concurrently.
     pub async fn reconcile_devices(self: &Arc<Self>, force_describe: bool) -> Result<Vec<DeviceInfo>, Failure> {
         let _guard = self.reconcile_lock.lock().await;
-        let all = device::list_all().await.map_err(|e| errors::explain(&e))?;
+        let (mux_res, core_list) = tokio::join!(device::list_all(), loadside_core::coredevice::list());
+        let all = match mux_res {
+            Ok(a) => a,
+            Err(e) if !core_list.is_empty() => {
+                debug!("usbmuxd listing failed ({e:#}); using CoreDevice only");
+                Vec::new()
+            }
+            Err(e) => return Err(errors::explain(&e)),
+        };
         let best = device::prefer_best_connections(all.clone());
+        let mux_udids: HashSet<String> = best.iter().map(|d| d.udid.clone()).collect();
+        // Network-paired devices macOS only exposes through CoreDevice.
+        let core_only: Vec<DeviceInfo> = core_list.into_iter().filter(|d| !mux_udids.contains(&d.udid)).collect();
 
+        let mut newly_core: Vec<String> = Vec::new();
         let (to_probe, mut list_changed) = {
             let mut reg = self.device_registry.lock().unwrap();
             let mut new_mux = HashMap::with_capacity(all.len());
@@ -1632,17 +1653,30 @@ impl Engine {
             }
             reg.mux = new_mux;
 
-            let present: HashSet<&str> = best.iter().map(|d| d.udid.as_str()).collect();
+            reg.core = core_only.iter().map(|d| d.udid.clone()).collect();
+            let present: HashSet<String> = mux_udids.union(&reg.core).cloned().collect();
             let before_len = reg.devices.len();
             reg.devices.retain(|u, d| {
-                let keep = present.contains(u.as_str());
+                let keep = present.contains(u);
                 if !keep {
-                    info!("Device no longer listed by usbmuxd: {} ({})", d.name, d.udid);
+                    info!("Device no longer reachable: {} ({})", d.name, d.udid);
                 }
                 keep
             });
-            reg.last_probe.retain(|u, _| present.contains(u.as_str()));
+            reg.last_probe.retain(|u, _| present.contains(u));
             let mut changed = reg.devices.len() != before_len;
+
+            for info in &core_only {
+                let prev = reg.devices.get(&info.udid);
+                if prev != Some(info) {
+                    if !prev.is_some_and(|d| d.paired) {
+                        info!("Device reachable over Wi-Fi via CoreDevice: {} ({})", info.name, info.udid);
+                        newly_core.push(info.udid.clone());
+                    }
+                    changed = true;
+                    reg.devices.insert(info.udid.clone(), info.clone());
+                }
+            }
 
             let mut probe_list = Vec::new();
             let retry_interval = Duration::from_secs(25);
@@ -1665,7 +1699,7 @@ impl Engine {
             (probe_list, changed)
         };
 
-        let mut newly_usable: Vec<String> = Vec::new();
+        let mut newly_usable: Vec<String> = newly_core;
         if !to_probe.is_empty() {
             let probed = futures::future::join_all(to_probe.iter().map(|d| async move {
                 let info = device::describe(d).await;
