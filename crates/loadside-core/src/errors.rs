@@ -175,7 +175,7 @@ pub fn classify(detail: &str, dev_code: Option<i64>, auth_code: Option<i64>) -> 
     }
 
     // ---- Device / installd ----
-    if has(&t, &["passwordprotected", "password protected", "device is locked"]) {
+    if has(&t, &["passwordprotected", "password protected", "device is locked", "device was still locked", "device was locked"]) {
         return f("device_locked", "Your device is locked.",
             "Unlock it and keep the screen on until installation finishes.");
     }
@@ -261,6 +261,10 @@ mod tests {
         assert_eq!(classify("Not enough available app IDs. 3 are required", None, None).code, "app_id_limit");
         assert_eq!(classify("installation failed: ApplicationVerificationFailed The maximum number of apps for free development profiles has been reached.", None, None).code, "free_app_limit");
         assert_eq!(classify("lockdown: PasswordProtected", None, None).code, "device_locked");
+        assert_eq!(
+            classify("installing over Wi-Fi (CoreDevice): The operation failed because the device was still locked.", None, None).code,
+            "device_locked"
+        );
         assert_eq!(classify("Auth error -22406: Your Apple ID or password was incorrect", None, Some(-22406)).code, "bad_credentials");
         assert_eq!(classify("weird", None, None).code, "unknown");
         // The two sign-in failures seen in the wild.

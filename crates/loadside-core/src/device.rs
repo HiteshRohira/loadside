@@ -436,7 +436,7 @@ pub async fn provider_for(udid: &str) -> Result<DynamicUsbmuxdProvider> {
     let devs = list_raw().await?;
     let dev = devs.iter().find(|d| d.udid == udid).ok_or_else(|| {
         crate::protocol::Failure::new("device_not_found", "The device isn't connected.")
-            .with_hint("Connect it with a cable (or enable Wi-Fi sync in Finder), unlock it, and retry.")
+            .with_hint("Make sure it's on the same Wi-Fi as this Mac and unlocked, then retry.")
     })?;
     Ok(provider(dev))
 }
@@ -571,35 +571,58 @@ pub async fn nudge_wifi_discovery() {
     let _ = child.wait().await;
 }
 
-/// An open connection to a device through usbmuxd (USB or Wi-Fi sync).
+/// An open connection to a device: legacy usbmuxd (USB, or classic Wi-Fi sync),
+/// or Apple's CoreDevice tunnel for network-paired devices usbmuxd doesn't list.
 #[derive(Debug)]
-pub struct Conn(pub DynamicUsbmuxdProvider);
+pub enum Conn {
+    Usbmuxd(DynamicUsbmuxdProvider),
+    CoreDevice(String),
+}
 
 impl Conn {
     pub fn describe(&self) -> String {
-        "usbmuxd".into()
-    }
-
-    async fn instproxy(&self) -> Result<InstallationProxyClient> {
-        InstallationProxyClient::connect(&self.0).await.context("connecting to installation_proxy")
+        match self {
+            Conn::Usbmuxd(_) => "usbmuxd".into(),
+            Conn::CoreDevice(_) => "CoreDevice (Wi-Fi)".into(),
+        }
     }
 
     /// Which of `bundle_ids` are currently installed.
     pub async fn installed(&mut self, bundle_ids: Vec<String>) -> Result<HashSet<String>> {
-        let mut ip = self.instproxy().await?;
-        let apps = ip.get_apps(Some("User"), Some(bundle_ids)).await.context("listing installed apps")?;
-        Ok(apps.into_keys().collect())
+        match self {
+            Conn::Usbmuxd(p) => {
+                let mut ip = InstallationProxyClient::connect(&*p).await.context("connecting to installation_proxy")?;
+                let apps = ip.get_apps(Some("User"), Some(bundle_ids)).await.context("listing installed apps")?;
+                Ok(apps.into_keys().collect())
+            }
+            Conn::CoreDevice(udid) => crate::coredevice::installed(udid, &bundle_ids).await,
+        }
     }
 
     pub async fn uninstall(&mut self, bundle_id: &str) -> Result<()> {
-        let mut ip = self.instproxy().await?;
-        ip.uninstall(bundle_id.to_string(), None).await.context("uninstalling app")?;
-        Ok(())
+        match self {
+            Conn::Usbmuxd(p) => {
+                let mut ip = InstallationProxyClient::connect(&*p).await.context("connecting to installation_proxy")?;
+                ip.uninstall(bundle_id.to_string(), None).await.context("uninstalling app")?;
+                Ok(())
+            }
+            Conn::CoreDevice(udid) => crate::coredevice::uninstall(udid, bundle_id).await,
+        }
     }
 
     /// Upload and install a signed .app (progress 0..=100).
-    pub async fn install(&mut self, app: &std::path::Path, progress: impl Fn(u64) + Send + Sync) -> Result<(), rootcause::Report> {
-        isideload::sideload::install::install_app(&self.0, app, progress).await
+    pub async fn install(&mut self, app: &std::path::Path, progress: impl Fn(u64) + Send + Sync) -> Result<()> {
+        match self {
+            Conn::Usbmuxd(p) => isideload::sideload::install::install_app(&*p, app, progress)
+                .await
+                .map_err(crate::errors::from_report),
+            Conn::CoreDevice(udid) => {
+                progress(5);
+                crate::coredevice::install(udid, app).await?;
+                progress(100);
+                Ok(())
+            }
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use tracing::info;
 use crate::engine::Engine;
 
 pub const NOT_CONNECTED_HINT: &str =
-    "Connect it with a cable and unlock it. With Wi-Fi sync on, it also works while the device is on the same Wi-Fi network as this Mac.";
+    "Make sure it's on the same Wi-Fi network as this Mac and unlocked. If it still doesn't appear, open Xcode → Window → Devices and Simulators once so macOS reconnects it over the network.";
 
 fn f(code: &str, msg: &str) -> Failure {
     Failure::new(code, msg)
@@ -88,13 +88,16 @@ impl Engine {
         }
     }
 
-    /// Open a connection through usbmuxd (USB or Wi-Fi sync).
-    /// Queries live usbmuxd directly if the cached device list is stale.
+    /// Open a connection: usbmuxd first (USB / classic Wi-Fi sync), then Apple's
+    /// CoreDevice Wi-Fi tunnel for network-paired devices usbmuxd doesn't list.
     pub(crate) async fn connect(&self, udid: &str) -> Result<Conn, Failure> {
-        match device::provider_for(udid).await {
-            Ok(p) => Ok(Conn(p)),
-            Err(_) => Err(f("device_not_found", &format!("{} isn't connected.", self.device_name(udid))).with_hint(NOT_CONNECTED_HINT)),
+        if let Ok(p) = device::provider_for(udid).await {
+            return Ok(Conn::Usbmuxd(p));
         }
+        if loadside_core::coredevice::find(udid).await.is_some() {
+            return Ok(Conn::CoreDevice(udid.to_string()));
+        }
+        Err(f("device_not_found", &format!("{} isn't reachable.", self.device_name(udid))).with_hint(NOT_CONNECTED_HINT))
     }
 
     fn require_usb(&self, udid: &str) -> Result<DeviceInfo, Failure> {

@@ -10,6 +10,7 @@
 pub mod account;
 pub mod client;
 pub mod config;
+pub mod coredevice;
 pub mod deb;
 pub mod device;
 pub mod errors;
